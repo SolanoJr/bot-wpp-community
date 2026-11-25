@@ -1,0 +1,93 @@
+# 🔐 ARQUIVOS SENSÍVEIS - NÃO COMMITAR
+.env
+.env.local
+.env.production
+
+# 🔐 CHAVES E SEGREDO
+*.key
+*.pem
+*.p12
+secrets.json
+credentials.json
+
+# 📱 SESSÕES DO WHATSAPP (auth real — NUNCA commitar)
+sessions/
+sessions.bak*/
+.wwebjs_auth/
+.wwebjs_cache/
+*.session
+*.store
+
+# 🔐 OUTROS .env / CREDENCIAIS LOCAIS
+.env-screen
+home/
+
+# 🗑️ LOCKFILE DE SUBPROJETO (gerado pelo build do screen server — não versionar)
+src/services/discord-screen/client/package-lock.json
+
+# 🔐 ARTEFATOS LOCAIS
+.env.backup
+.whatsapp-instance.lock
+
+# 🗑️ BANCO DE DADOS / RUNTIME STATE (gerado em runtime)
+data/
+tmp/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.jsonl
+*.log
+
+# 🗑️ ARTEFATOS DE LABORATÓRIO (resultados temporários)
+laboratorio/*.json
+laboratorio/*.jsonl
+laboratorio/test-*.ts
+laboratorio/casino-*-result.json
+laboratorio/delete-test-result.json
+
+# 🗑️ ARTEFATOS DO WINDOWS
+Thumbs.db
+nul
+scripts/logs/
+
+# 📊 RELATÓRIOS E TEMP
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# 📦 DEPENDÊNCIAS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 🚀 BUILD
+dist/
+build/
+.next/
+
+# 🔐 BACKUPS E CONFIGURAÇÕES SENSÍVEIS
+backups/
+config/local.json
+config/production.json
+
+# 🗑️ RUNTIME STATE ORFÃO (não versionar)
+src/.pending-messages.json
+
+# 🧪 DIAGNÓSTICOS LOCAIS (descartáveis)
+diag_*.cjs
+temp_*.cjs
+# Dumps de laboratório (artefatos de investigação)
+laboratorio/dumps/
+
+# 🗑️ ARQUIVOS OPERACIONAIS (runtime nativos — não versionar)
+data.backup/
+*.preD2B
+/lab-flip.js
+/probe-*.js
+group-lists.json
+coverage/

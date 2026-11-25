@@ -1,0 +1,174 @@
+/**
+ * 🔒 WarriorBlack - Tipos Base Multi-Plataforma
+ *
+ * Interfaces agnósticas de plataforma para unificar WhatsApp, Telegram e Discord
+ */
+
+export type PlatformType = string;
+// Valores conhecidos: 'whatsapp' | 'telegram' | 'discord'.
+// Para múltiplas contas WhatsApp (multi-número), usamos chaves derivadas:
+//   whatsapp:<phone>  (ex: 'whatsapp:558581344211')
+// O PlatformManager aceita qualquer string como chave de adapter.
+export function wppSessionKey(phone: string): string {
+  return `whatsapp:${phone.replace(/[^0-9]/g, '')}`;
+}
+
+export interface PlatformUser {
+  id: string;                    // ID único na plataforma (ex: "5511999999999@c.us" | "123456789" | "123456789012345678")
+  name: string;                  // Nome de exibição
+  username?: string;             // Username/handle se houver
+  isBot: boolean;
+  platform: PlatformType;
+  // Permissões de grupo (populadas pelo adapter a partir do metadata da plataforma).
+  // Usadas por comandos destrutivos (ban/kick/promote) para blindar BOT e DONO.
+  isAdmin?: boolean;
+  isSuperAdmin?: boolean;
+  isOwner?: boolean;
+  isBusiness?: boolean;            // Conta business (WWebJS/legado)
+  raw: any;                      // Objeto original da plataforma
+}
+
+export interface PlatformChat {
+  id: string;                    // ID único do chat/grupo (ex: "5511999999999-123456@g.us" | "-1001234567890" | "123456789012345678")
+  name: string;                  // Nome do grupo ou "Chat Privado"
+  isGroup: boolean;
+  platform: PlatformType;
+  description?: string;            // Descrição do grupo (WWebJS/legado)
+  participants?: PlatformUser[]; // Para grupos
+  raw: any;
+  // Metadados extras (WWebJS/legado)
+  metadata?: any;
+  // Flag para indicar se as permissões dos participantes foram verificadas
+  // Útil quando getChat() falha (ex: erro "r" no WhatsApp) e participantes não puderam ser obtidos
+  isPermissionsVerified?: boolean;
+}
+
+export interface PlatformMessage {
+  id: string;                    // ID único da mensagem
+  chatId: string;                // ID do chat onde foi enviada
+  userId: string;                // ID do autor
+  userName: string;              // Nome do autor
+  text: string;                  // Conteúdo textual
+  timestamp: Date;               // Quando foi enviada
+  isFromMe: boolean;             // Se o bot enviou
+  isCommand: boolean;            // Se começa com prefixo de comando
+  commandName?: string; // Nome do comando (sem prefixo)
+  commandPrefix?: string; // '$' (uteis) ou '#' (fun/midia)
+  args?: string[];               // Argumentos parseados
+  platform: PlatformType;
+  raw: any;                      // Objeto original da plataforma
+  // Metadados opcionais
+  replyToMessageId?: string;     // ID da mensagem respondida
+  mentions?: PlatformUser[];     // Usuários mencionados
+  hasMedia: boolean;
+  mediaType?: 'image' | 'video' | 'audio' | 'document' | 'sticker' | 'location' | 'contact';
+  // Metadados de quote (WWebJS/legado)
+  quotedId?: string;
+  quotedText?: string;
+  quotedSender?: string;
+  quotedFromMe?: boolean;
+  quotedParticipant?: string;    // ID do participante quotado (Baileys)
+  // Correlation ID para tracing entre plataformas e serviços
+  correlationId?: string;
+  // Metadados extras da plataforma
+  metadata?: any;
+}
+
+export interface PlatformClient {
+  platform: PlatformType;
+  userId: string;                    // ID do bot na plataforma
+  userName: string;                  // Nome do bot
+  isReady: boolean;
+  // Métodos principais
+  sendMessage(chatId: string, text: string, options?: SendOptions): Promise<PlatformMessage>;
+  sendMedia(chatId: string, media: MediaPayload, caption?: string, options?: SendOptions): Promise<PlatformMessage>;
+  getChat(chatId: string): Promise<PlatformChat>;
+  getUser(userId: string): Promise<PlatformUser>;
+  getChats(): Promise<PlatformChat[]>;
+  // Gestão de membros em grupos (multiplataforma)
+  removeParticipant(chatId: string, userId: string): Promise<void>;
+  banParticipant(chatId: string, userId: string): Promise<void>;
+  onMessage(handler: MessageHandler): void;
+  onReady(handler: () => void): void;
+  onDisconnected(handler: (reason: string) => void): void;
+  react?(messageId: string, emoji: string, chatId?: string, originalKey?: any): Promise<void>;
+  // Resolução de contatos (específico do WhatsApp — Baileys/WWebJS).
+  // Opcional: plataformas sem noção de "número de telefone" não implementam.
+  getNumberId?(phone: string): Promise<{ serialized: string; lid?: string } | null>;
+  getContactById?(id: string): Promise<PlatformUser | null>;
+  // Gestão de moderação multiplataforma (25/out, auditoria):
+  //   - mute/unmute/promote/demote da interface antiga eram fantasmas
+  //     (0 adapters, 0 callers) e foram removidos.
+  //   - promoteParticipant é REAL: assinatura com chatId (a antiga
+  //     promote(userId) não servia para operação de grupo), usada por
+  //     commands/promover.ts e implementada pelo BaileysAdapter via
+  //     groupParticipantsUpdate(..., 'promote').
+  //   - demote não tem caller nem comando — se $despromover nascer,
+  //     nasce com assinatura com chatId, não ressuscitando a fantasma.
+  promoteParticipant?(chatId: string, userId: string): Promise<void>;
+  shutdown(): Promise<void>;
+}
+
+export type MessageHandler = (message: PlatformMessage) => Promise<void>;
+
+export interface SendOptions {
+  replyToMessageId?: string;
+  quotedFromMe?: boolean;
+  quotedParticipant?: string;
+  parseMode?: 'markdown' | 'html' | 'none';
+  disablePreview?: boolean;
+  buttons?: ButtonOptions[];
+  sendAudioAsVoice?: boolean;       // Enviar áudio como mensagem de voz (PTT)
+  mentionedIds?: string[];          // IDs de usuários a mencionar
+  messageThreadId?: string | number; // ID do tópico/fórum (Telegram message_thread_id)
+  delete?: { id: string | number; fromMe?: boolean; participant?: string };
+}
+
+export interface ButtonOptions {
+  text: string;
+  callbackData?: string;
+  url?: string;
+}
+
+export interface MediaPayload {
+  type: 'image' | 'video' | 'audio' | 'document' | 'sticker';
+  data: Buffer | string;         // Buffer ou path/URL
+  filename?: string;
+  mimetype?: string;
+}
+
+export interface PlatformAdapter {
+  readonly platform: PlatformType;
+  readonly client: PlatformClient;
+  initialize(): Promise<void>;
+  shutdown(): Promise<void>;
+}
+
+export interface CommandContext {
+  msg: PlatformMessage;
+  client: PlatformClient;
+  args: string[];
+  platform: PlatformType;
+  chatId: string;
+  userId: string;
+  userName: string;
+  groupName?: string;
+  isGroup: boolean;
+  isMaster: boolean;
+  isAdmin: boolean;
+  reply(text: string, options?: SendOptions): Promise<void>;
+  replyPrivate(text: string): Promise<void>;
+  getChat(): Promise<PlatformChat>;
+  getUser(): Promise<PlatformUser>;
+}
+
+export interface ICommand {
+  name: string;
+  description: string;
+  platforms?: PlatformType[];    // Se undefined, disponível em todas
+  aliases?: string[];            // Aliases opcionais do comando
+  usage?: string;                // Exemplo de uso (ex: '$cmd [arg]')
+  category?: string;             // Categoria para menu/help
+  cooldown?: number;             // ms de cooldown por usuário (opcional)
+  execute(ctx: CommandContext): Promise<void> | void;
+}

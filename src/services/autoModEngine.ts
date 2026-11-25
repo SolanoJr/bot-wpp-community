@@ -1,0 +1,1087 @@
+/**
+ * autoModEngine.ts — Motor de moderação automática (engine Baileys / ativo).
+ *
+ * Regras (flags no group_mod, databaseService):
+ *   antiestrangeiro  — ban+remove+delete TODO não-brasileiro (DDI != 55).
+ *   remover          — anti-bot por padrões (foreign + conteúdo suspeito + nome suspeito + repetido).
+ *   autolink         — delete mensagem + announce se link de domínio suspeito.
+ *   antispam         — delete mensagem + announce se palavra-chave de spam + contexto (link/fingerprint/foreign).
+ *   detectar         — announce toggle (anuncia no grupo todas as ações se on).
+ *
+ * Integração: BaileysAdapter.dispatchMessage → fire-and-forget (não bloqueia caminho crítico).
+ *
+ * ATENÇÃO: delete mensagem só funciona se bot é admin do grupo. Se não for, a deleção falha (log) —
+ *          a remoção do participante (ban) ainda funciona se bot for admin.
+ */
+import { WAMessage } from '@whiskeysockets/baileys';
+import { randomUUID } from 'node:crypto';
+import {
+  getGroupMod,
+  banUser,
+  recordMessageFingerprint,
+  getRecentFingerprintCount,
+  cleanupOldFingerprintEntries,
+  cleanupOldJoinEntries,
+} from './databaseService.js';
+import { recordInfraction } from './infractions.js';
+import { isProtectedTarget } from '../services/permissions.js';
+import { isSenderGroupAdmin } from './groupAdmin.js';
+import { consumeFirstMessage } from './recentJoinTracker.js';
+import { logInfo, logWarning, logError } from './loggerService';
+import { requestConfirmedDelete, type DeleteOutcome } from './deleteConfirmationService';
+
+// ─── Cassino Classifier ─────────────────────────────────────────────────
+import { classifyCasino } from './casinoClassifier.js';
+
+// ─── Configurações editáveis ────────────────────────────────────────────────
+const SUSPICIOUS_DOMAINS = [
+  'wtf', 'bet', 'game', 'games', 'win', 'xyz', 'top', 'click',
+  'casino', 'bonus', 'aposta', 'apostas', 'vareja', 'sport', 'jackpot',
+  'slots', 'poker', 'bing', 'lucky', 'vip', 'gratuito', 'fun', 'pk', 'sh',
+  'play', 'fortune', 'tiger', 'rabbit', 'ox', 'mouse', 'pgsoft', '777',
+  'ck7', 'kl7', 'score', 'result', 'draw', 'match', 'live', 'stream', 'tv',
+  'betano', 'betfair', 'betsafe', 'mariobet', 'sportingbet', ' Bet365',
+  'blaze', 'chilli', 'pragmatic', 'pgsoft', 'jdb', 'jcm', 'spadegaming',
+  'microgaming', 'playtech', 'evolution', 'netent', 'novomatic',
+];
+
+const SPAM_KEYWORDS = [
+  'ganhe dinheiro', 'lucro fácil', 'recolha', 'recolha contínua', 'bónus', 'bônus',
+  'taxa de vitórias', 'jogue e ganhe', 'dinheiro fácil', 'recolhidos à vontade',
+  'coloque agora', 'ptsu mae', 'ganhar', 'sorte', 'acumulado', 'presentes 777',
+  '777-7777', 'ck7', 'ck7bet', 'plataforma nova', 'rodadas grátis', 'giros grátis',
+  'pagando muito', 'deposite', 'saque rápido', 'link de cadastro', 'kl7.games',
+  'ck7bet.com', 'ck7bet.com.br', 'jogos grátis', 'promoção', 'bônus de boas-vindas',
+  'jogue e ganhe dinheiro', 'ganhe enquanto joga', 'lucre', 'retirar', 'saque',
+  'dinheiro real', 'pagamento', 'cashout', 'parlay', 'apostando', 'assistir',
+  'jogadores', 'vitórias', 'regras', 'o que você precisa', 'já está pronto',
+  '50%', '100%', 'isenção', 'absolutamente', 'sem risco', 'gratuito',
+  'apps', 'baixe', 'instale', 'jogue online', 'apostas esportivas',
+];
+
+const SUSPICIOUS_DISPLAY_NAMES: RegExp[] = [
+  /^\s*$/,                                       // nome vazio
+  /^[\s\p{Emoji}\p{Other_Symbol}\p{Punctuation}]+$/u, // só emojis/símbolos
+  /^(bot|🤖|botão|robô|assistant|auto|spammer|spam)$/i,
+];
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Monta a chave de DELETE a partir da WAMessage ORIGINAL.
+ *
+ * ⚠️ Não reconstruir a chave do zero: em grupos com addressingMode 'lid' o
+ * Baileys exige `participantAlt`/`addressingMode` para o servidor aceitar o
+ * revoke. Reconstruir com { id, remoteJid, fromMe, participant } produzia uma
+ * chave incompleta e o delete podia falhar silenciosamente.
+ *
+ * Preserva todos os campos da key original; só normaliza `fromMe` para false
+ * (só se deleta mensagem de terceiros).
+ */
+function buildDeleteKey(msg: WAMessage, senderJid: string): any {
+  const orig: any = (msg as any)?.key || {};
+  const key: any = {
+    id: orig.id,
+    remoteJid: orig.remoteJid,
+    fromMe: false,
+    participant: orig.participant || senderJid,
+  };
+  // Campos que o Baileys v7 usa para resolver o remetente em grupos @lid
+  if (orig.participantAlt) key.participantAlt = orig.participantAlt;
+  if (orig.addressingMode) key.addressingMode = orig.addressingMode;
+  if (orig.remoteJidAlt) key.remoteJidAlt = orig.remoteJidAlt;
+  if (orig.participantUsername) key.participantUsername = orig.participantUsername;
+  if (orig.server_id) key.server_id = orig.server_id;
+  return key;
+}
+
+function extractNumber(jid: string): string {
+  return (jid || '').replace(/\D/g, '');
+}
+
+/**
+ * O remetente tem DDI estrangeiro?
+ *
+ * ⚠️ Um LID (`123456789012345@lid`) NÃO é um número de telefone — é um
+ * identificador opaco do WhatsApp, sem DDI. Tratá-lo como telefone fazia
+ * `isForeignNumber()` retornar `true` para TODO membro de grupo com
+ * addressingMode 'lid' — ou seja, o antiestrangeiro baniria o grupo inteiro
+ * quando audit_only=0.
+ *
+ * Regra: só é possível decidir DDI a partir de um PN (`@s.whatsapp.net` /
+ * `@c.us`). Para LID, retorna false (indeterminado → não pune).
+ */
+export function isForeignNumber(jid: string): boolean {
+  const s = String(jid || '');
+  // LID não carrega DDI — não é telefone.
+  if (s.includes('@lid')) return false;
+  const n = extractNumber(s);
+  if (!n) return false;
+  // Só decide com um PN reconhecível.
+  if (!s.includes('@')) return false;
+  return !n.startsWith('55');
+}
+
+/**
+ * DDI estrangeiro a partir do PN associado à mensagem.
+ *
+ * Em grupos com `addressingMode: 'lid'`, o `participant` é um LID (sem DDI) e
+ * o número real só existe em `key.participantAlt`. Esta função olha os dois,
+ * preferindo o PN — é o único que carrega DDI.
+ */
+export function isForeignSender(msg: WAMessage, senderJid: string): boolean {
+  const alt: string = String((msg as any)?.key?.participantAlt || '');
+  if (alt && isForeignNumber(alt)) return true;
+  return isForeignNumber(senderJid);
+}
+
+/** Normaliza nome para checagem de bot-pattern. */
+function normalizeDisplayName(name: string): string {
+  return (name || '').toLowerCase().trim();
+}
+
+/** Se o display name é suspeito (vazio, só emojis/símbolos, nome típico de bot). */
+export function isSuspiciousDisplayName(name: string): boolean {
+  const n = normalizeDisplayName(name);
+  if (!n) return true;
+  if (SUSPICIOUS_DISPLAY_NAMES.some(r => r.test(n))) return true;
+  // nomes que contêm apenas dígitos e/ou símbolos (sem letras)
+  const letters = n.replace(/[^a-záàâãéèêíóôõöúç]/gi, '').length;
+  if (letters === 0) return true;
+  return false;
+}
+
+/** Extrai texto de mensagem interativa usando API pública do Baileys (proto.Message). */
+export function extractTextFromWAMessage(msg: WAMessage): string {
+  const m = msg.message as any;
+  const parts: string[] = [];
+
+  // Texto simples / extended text
+  if (m.conversation) parts.push(String(m.conversation));
+  if (m.extendedTextMessage) {
+    const etm = m.extendedTextMessage;
+    if (etm.text) parts.push(String(etm.text));
+    if (etm.caption) parts.push(String(etm.caption));
+    // link preview (campo com hífen precisa de index signature)
+    try {
+      const lp = etm['linkPreview'];
+      if (lp && typeof lp === 'object') {
+        const url = lp['canonical-url'] || lp['matchedText'] || '';
+        if (url) parts.push(String(url));
+        const title = lp.title || '';
+        const desc = lp.description || '';
+        if (title) parts.push(String(title));
+        if (desc) parts.push(String(desc));
+      }
+    } catch { /* ignorar */ }
+  }
+
+  // Legendas de mídia (imagem, vídeo, documento)
+  if (m.imageMessage?.caption) parts.push(String(m.imageMessage.caption));
+  if (m.videoMessage?.caption) parts.push(String(m.videoMessage.caption));
+  if (m.documentMessage?.caption) parts.push(String(m.documentMessage.caption));
+
+  // Botões
+  if (m.buttonsMessage) {
+    const bm = m.buttonsMessage as any;
+    if (bm.contentText) parts.push(String(bm.contentText));
+    if (bm.footerText) parts.push(String(bm.footerText));
+    if (bm.headerText) parts.push(String(bm.headerText));
+    const buttons = bm.buttons || [];
+    for (const b of buttons) {
+      if (b.buttonText && typeof b.buttonText === 'object' && b.buttonText.displayText) {
+        parts.push(String(b.buttonText.displayText));
+      }
+      if (b.buttonId) parts.push(String(b.buttonId));
+      // botões interativos (quick_reply / cta_url / cta_copy / cta_call)
+      try {
+        const params = b.buttonParamsJson ? JSON.parse(String(b.buttonParamsJson)) : null;
+        if (params) {
+          if (params.display_text) parts.push(String(params.display_text));
+          if (params.url && !parts.some(p => p === params.url)) parts.push(String(params.url));
+          if (params.copy_code) parts.push(`copy:${params.copy_code}`);
+        }
+      } catch { /* ignorar */ }
+    }
+  }
+
+  // Resposta de botão (quando usuário clica)
+  if (m.buttonsResponseMessage) {
+    const br = m.buttonsResponseMessage as any;
+    if (br.buttonReply && br.buttonReply.displayText) {
+      parts.push(String(br.buttonReply.displayText));
+    }
+  }
+
+  // Listas / respostas de lista
+  if (m.listMessage) {
+    const lm = m.listMessage as any;
+    if (lm.title) parts.push(String(lm.title));
+    if (lm.description) parts.push(String(lm.description));
+  }
+  if (m.listResponseMessage) {
+    const lr = m.listResponseMessage as any;
+    if (lr.title) parts.push(String(lr.title));
+    if (lr.description) parts.push(String(lr.description));
+    if (lr.listSelectedId) parts.push(`list:${lr.listSelectedId}`);
+  }
+
+  // Templates (card/buttons) — Baileys pode expor como templateMessage
+  if (m.templateMessage) {
+    const tm = m.templateMessage as any;
+    try {
+      // hydrated fields podem estar em hydratedTemplate ou diretamente
+      const hydrated = tm.hydratedTemplate || tm;
+      if (hydrated.hydratedContentText) parts.push(String(hydrated.hydratedContentText));
+      if (hydrated.hydratedTitleText) parts.push(String(hydrated.hydratedTitleText));
+      if (hydrated.hydratedFooterText) parts.push(String(hydrated.hydratedFooterText));
+    } catch { /* ignorar */ }
+  }
+
+  // Interactive message genérico (cards, quick replies etc.)
+  if (m.interactiveMessage) {
+    const im = m.interactiveMessage as any;
+    if (im.body && typeof im.body === 'object' && im.body.text) parts.push(String(im.body.text));
+    if (im.footer && typeof im.footer === 'object' && im.footer.text) parts.push(String(im.footer.text));
+    if (im.header && typeof im.header === 'object' && im.header.title) parts.push(String(im.header.title));
+    const buttons = im.nativeFlowMessage?.buttons || [];
+    for (const b of buttons) {
+      if (typeof b.buttonParamsJson === 'string') {
+        try {
+          const parsed = JSON.parse(b.buttonParamsJson);
+          if (parsed.display_text) parts.push(String(parsed.display_text));
+          if (parsed.url) parts.push(String(parsed.url));
+        } catch { /* ignorar */ }
+      }
+    }
+  }
+
+  // Resposta de interactive
+  if (m.interactiveResponseMessage) {
+    const irm = m.interactiveResponseMessage as any;
+    if (irm.contextInfo && typeof irm.contextInfo === 'object' && irm.contextInfo.displayText) {
+      parts.push(String(irm.contextInfo.displayText));
+    }
+  }
+
+  // Mensagem forward
+  if ((m as any).forward) {
+    const fwd = (m as any).forward;
+    try {
+      if (fwd.from && typeof fwd.from === 'object' && fwd.from.pushName) {
+        parts.push(`[forward:${fwd.from.pushName}]`);
+      }
+    } catch { /* ignorar */ }
+  }
+
+  // Contato enviado
+  if ((m as any).contacts) {
+    const cts = (m as any).contacts;
+    if (cts.displayName) parts.push(`[contato:${cts.displayName}]`);
+  }
+
+  // Poll
+  if ((m as any).poll) parts.push(`[poll:${(m as any).poll?.question || ''}]`);
+
+  // grupo convite
+  if (m.groupInviteMessage) {
+    const gim = m.groupInviteMessage as any;
+    if (gim.text) parts.push(String(gim.text));
+    if (gim.subject) parts.push(String(gim.subject));
+  }
+
+  // Pin / evento / etc. — ignorar (não geram conteúdo textual relevante para moderação)
+
+  return parts.join(' ').trim();
+}
+
+/** Extrai URLs do texto. */
+/** True quando a mensagem e o aviso automatico "este grupo foi mencionado" (story). */
+export function isStoryMentionMessage(msg: WAMessage): boolean {
+  const m: any = (msg as any)?.message || {};
+  const texto = extractTextFromWAMessage(msg);
+  const candidatos = [
+    texto,
+    m?.conversation,
+    m?.extendedTextMessage?.text,
+    m?.imageMessage?.caption,
+    m?.videoMessage?.caption,
+    m?.statusUpdateMessage?.text,
+    m?.message?.extendedTextMessage?.text,
+    JSON.stringify(m?.contextInfo || {}),
+  ].filter(Boolean).join(' ');
+  return /este grupo foi mencionado|esse grupo foi mencionado|this group was mentioned/i.test(candidatos);
+}
+
+export function extractUrls(text: string): string[] {
+  const urls: string[] = [];
+  const re = /https?:\/\/[^\s<>"']+|www\.[^\s<>"']+/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    let u = m[0];
+    if (u.startsWith('www.')) u = 'http://' + u;
+    if (!urls.includes(u)) urls.push(u);
+  }
+  return urls;
+}
+
+/** Extrai domínios das URLs para checagem (hostname completo, TLD e subpartes). */
+export function extractDomains(urls: string[]): string[] {
+  const domains: string[] = [];
+  for (const u of urls) {
+    try {
+      const p = new URL(u);
+      const hostname = (p.hostname || '').toLowerCase();
+      if (hostname && !domains.includes(hostname)) {
+        domains.push(hostname);
+      }
+      const dparts = hostname.split('.');
+      for (const part of dparts) {
+        if (part && !domains.includes(part)) {
+          domains.push(part);
+        }
+      }
+    } catch { /* ignorar URL inválida */ }
+  }
+  return domains;
+}
+
+/** Se algum domínio é suspeito. */
+export function isSuspiciousDomain(domains: string[]): boolean {
+  for (const d of domains) {
+    for (const s of SUSPICIOUS_DOMAINS) {
+      if (d.includes(s)) return true;
+    }
+  }
+  return false;
+}
+
+/** Se o texto contém alguma palavra-chave de spam. */
+export function containsSpamKeyword(text: string): boolean {
+  const low = text.toLowerCase();
+  return SPAM_KEYWORDS.some(kw => low.includes(kw));
+}
+
+/** Gera fingerprint do texto (para anti-spam: detecta mensagem repetida). */
+export function fingerprint(text: string): string {
+  // Normaliza: minúsculas, sem duplicatas de espaço, sem URLs, sem emojis pesados
+  let t = text.toLowerCase().trim();
+  t = t.replace(/\s+/g, ' ');
+  t = t.replace(/https?:\/\/[^\s]+/g, '[URL]');
+  t = t.replace(/[^\p{L}\p{N}\p{Z}\p{P}]/gu, ''); // remove emojis e outros caracteres não-ASCII
+  // Tamanho máximo para fingerprint (evita fingerprints muito específicos que nunca se repetem)
+  if (t.length > 120) t = t.slice(0, 120);
+  return t;
+}
+
+// ─── Contexto de integração com o adapter ─────────────────────────────────
+
+interface AutoModContext {
+  sock: any;
+  userId: string;
+  groupName: string;
+  fromMe?: boolean;
+  getChat: (jid: string) => Promise<{ participants: any[]; id: string; subject?: string } | null>;
+  sendMessage: (jid: string, text: string, opts?: any) => Promise<any>;
+  removeParticipant: (groupId: string, userId: string) => Promise<void>;
+  log: (...args: any[]) => void;
+  warn: (...args: any[]) => void;
+  error: (...args: any[]) => void;
+}
+
+// ─── AntiBot: Sinais Estruturais de Bot/Spammer ───────────────────────────
+
+/**
+ * Extrai sinais estruturais de bot/spammer da mensagem.
+ * 
+ * NÃO decide se é bot — apenas retorna os SINAIS estruturais encontrados.
+ * A decisão final é feita pelo score somatório INC-008 (somaPesos): thresholds
+ * graduados 6/8/10 + combo especial (card + foreign + primeira msg pós-join).
+ * 
+ * Sinais estruturais detectados:
+ * - buttonsMessage: mensagem com botões
+ * - listMessage: mensagem com lista
+ * - templateMessage: template com botões CTA
+ * - interactiveMessage: mensagem interativa
+ * - productMessage: mensagem de produto
+ * 
+ * NÃO inclui: stickerMessage, imageMessage, videoMessage, documentMessage,
+ * conversation, extendedTextMessage (são mensagens humanas normais).
+ */
+export function extractAntiBotSignals(msg: WAMessage): string[] {
+  const signals: string[] = [];
+  const m = msg.message || {};
+
+  // Padrões estruturais característicos de bots/spammers
+  if (m.buttonsMessage) {
+    signals.push('buttonsMessage');
+  }
+  if (m.listMessage) {
+    signals.push('listMessage');
+  }
+  if (m.templateMessage) {
+    signals.push('templateMessage');
+  }
+  if (m.interactiveMessage) {
+    signals.push('interactiveMessage');
+  }
+  if (m.productMessage) {
+    signals.push('productMessage');
+  }
+
+  return signals;
+}
+
+// ─── Engine ────────────────────────────────────────────────────────────────
+
+export interface AutoModResult {
+  acted: boolean;
+  reason: string;
+  action: string;
+  moderationState: AutoModModerationState;
+}
+
+export type AutoModFinalState = 'NONE' | 'AUDIT_ONLY' | 'PASS' | 'FAIL' | 'TIMEOUT';
+
+export interface AutoModModerationState {
+  detected: boolean;
+  actionPlanned: boolean;
+  deleteRequested: boolean;
+  deleteAccepted: boolean;
+  deleteConfirmed: boolean;
+  finalState: AutoModFinalState;
+}
+
+function makeModerationState(overrides: Partial<AutoModModerationState> = {}): AutoModModerationState {
+  return {
+    detected: false,
+    actionPlanned: false,
+    deleteRequested: false,
+    deleteAccepted: false,
+    deleteConfirmed: false,
+    finalState: 'NONE',
+    ...overrides,
+  };
+}
+
+export function moderationStateFromDeleteOutcome(outcome: DeleteOutcome): Pick<AutoModModerationState, 'deleteRequested' | 'deleteAccepted' | 'deleteConfirmed' | 'finalState'> {
+  return {
+    deleteRequested: outcome.requested,
+    deleteAccepted: outcome.accepted,
+    deleteConfirmed: outcome.confirmed,
+    finalState: outcome.finalState,
+  };
+}
+
+// ─── INC-008: pesos e score do antibot ──────────────────────────────
+// Sinais e pesos v1 (design aprovado). O design chamava "link-cassino":
+// a evidência real é o sinal 'link-suspeito' (isSuspiciousDomain).
+// Thresholds: <6 nada · 6-7 delete+infraction · 8-9 delete+announce ·
+// >=10 delete+evidência p/ admin. Ban/kick SÓ no combo especial
+// (estrutura-bot + foreign + primeira msg pós-join).
+export const ANTIBOT_SIGNAL_WEIGHTS: Record<string, number> = {
+  'estrutura-bot': 5,
+  'link-suspeito': 4,
+  'spam-keyword': 3,
+  'repeticao': 3,
+  'nome-suspeito': 2,
+  'foreign': 2,
+};
+
+/** Pura: soma os pesos dos sinais. 'estrutura-bot(buttonsMessage)'
+ *  desconta o sufixo de auditoria antes de pesar. Sinal desconhecido = 0. */
+export function somaPesos(signals: string[]): number {
+  return signals.reduce((acc, s) => {
+    const base = String(s).split('(')[0].trim();
+    return acc + (ANTIBOT_SIGNAL_WEIGHTS[base] ?? 0);
+  }, 0);
+}
+
+export async function evaluate(
+  msg: WAMessage,
+  ctx: AutoModContext,
+  groupId: string,
+  senderJid: string,
+  senderName: string,
+): Promise<AutoModResult> {
+  const messageKey = (msg as any)?.key || {};
+  ctx.log('[AutoMod] DRY-RUN message key capture', {
+    mode: 'log-only',
+    stanzaId: messageKey.id || null,
+    remoteJid: messageKey.remoteJid || null,
+    participant: messageKey.participant || null,
+    fromMe: typeof messageKey.fromMe === 'boolean' ? messageKey.fromMe : null,
+    originalWAMessageKey: messageKey,
+  });
+
+  // Pular mensagens do próprio bot (evita loop de autoMod)
+  const botId = (ctx.userId || '').replace(/:.*/, '');
+  const senderId = (senderJid || '').replace(/:.*/, '');
+  if (senderId === botId || senderJid.toLowerCase().includes('558581344211')) {
+    return { acted:false, reason:'mensagem do próprio bot — ignorada', action:'none', moderationState: makeModerationState() };
+  }
+
+  // Validação: senderJid não pode ser o JID do próprio grupo (evita false positive de foreign)
+  if (senderJid && groupId && senderJid === groupId) {
+    return { acted:false, reason:'senderJid igual ao groupId — ignorando', action:'none', moderationState: makeModerationState() };
+  }
+
+  // Validação: senderJid deve ter participant/remoteJid válido (não pode ser só o grupo)
+  if (senderJid && !senderJid.includes('@')) {
+    return { acted:false, reason:'senderJid inválido (sem @) — ignorando', action:'none', moderationState: makeModerationState() };
+  }
+
+  // 1. Extração de conteúdo
+  const text = extractTextFromWAMessage(msg);
+  const urls = extractUrls(text);
+  const domains = extractDomains(urls);
+  const fp = fingerprint(text);
+
+  // 1b. Anti-loop / proteção da própria mensagem (DUPLA DEFESA).
+  // O normalizer já filtra `fromMe`, mas o engine é chamado por outros caminhos
+  // (testServer, harness, lab). Sem este guard, uma mensagem do próprio bot
+  // poderia ser avaliada e punida — criando loop ou auto-punição.
+  if ((msg as any)?.key?.fromMe === true) {
+    ctx.log('[AutoMod] mensagem do próprio bot — ignorando (anti-loop)');
+    return { acted: false, reason: 'mensagem do próprio bot', action: 'none', moderationState: makeModerationState() };
+  }
+
+  // 2. Config do grupo
+  let config;
+  try {
+    config = await getGroupMod(groupId);
+  } catch (err: any) {
+    ctx.warn('[AutoMod] erro ao carregar config:', err?.message);
+    return { acted:false, reason:'erro ao carregar config', action:'none', moderationState: makeModerationState({ finalState: 'FAIL' }) };
+  }
+
+  // Nada ligado → return
+    const anyOn = config.antiestrangeiro || config.remover || config.autolink
+      || config.antispam || config.antibot === true || config.antistory === true || config.casino === true;
+    if (!anyOn) {
+      ctx.log(`[AutoMod] grupo ${groupId}: nada ligado — ignorando`);
+      return { acted:false, reason:'nada ligado', action:'none', moderationState: makeModerationState() };
+    }
+
+    // A política de execução é persistida por grupo; grupos novos começam com
+    // audit_only=false, mas sem nenhuma regra ligada. Não usar bloqueio global.
+    const isAuditOnly = config.audit_only === true;
+    if (isAuditOnly) {
+      ctx.log(`[AutoMod] grupo ${groupId}: MODO AUDITORIA — apenas detectar e registrar`);
+    }
+
+    const requestModerationDelete = async (targetKey: any): Promise<DeleteOutcome> => {
+      const correlationId = randomUUID();
+      ctx.log('[AutoMod] delete confirmation request', {
+        correlationId,
+        targetMessageId: targetKey?.id || null,
+        remoteJid: targetKey?.remoteJid || groupId,
+      });
+      const outcome = await requestConfirmedDelete({
+        platform: 'whatsapp',
+        chatId: groupId,
+        targetKey,
+        correlationId,
+        sock: ctx.sock,
+        sendDelete: () => ctx.sendMessage(groupId, '', { delete: targetKey }),
+      });
+      ctx.log('[AutoMod] delete confirmation outcome', { correlationId, ...moderationStateFromDeleteOutcome(outcome) });
+      return outcome;
+    };
+
+    // ─── ANTI-STORY: "este grupo foi mencionado" em story ───
+    // Regra do dono: 1 ocorrencia ja bane. Apaga SOMENTE a mensagem do aviso.
+    if (config.antistory === true && isStoryMentionMessage(msg)) {
+      ctx.log('[AutoMod] ANTISTORY detectado', { senderJid, groupId, msgId: messageKey.id });
+      const storyDelete = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+      if (storyDelete.finalState !== 'PASS') {
+        ctx.warn(`[AutoMod] ANTISTORY: delete nao confirmado (${storyDelete.finalState}) — sem ban`);
+        return {
+          acted: false,
+          reason: `antistory delete-failed (${storyDelete.finalState})`,
+          action: 'antistory-delete-failed',
+          moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(storyDelete) },
+        };
+      }
+      try {
+        await banUser({ groupId, userId: senderJid, reason: 'antistory-story-mention' });
+      } catch (err: any) { ctx.warn('[AutoMod] erro ao banir (antistory):', err?.message); }
+      try {
+        await ctx.removeParticipant(groupId, senderJid);
+        ctx.log(`[AutoMod] ANTISTORY: removido ${senderJid}`);
+      } catch (err: any) {
+        ctx.warn(`[AutoMod] erro ao remover ${senderJid} (antistory):`, err?.message);
+      }
+      if (config.detectar === true) {
+        try {
+          await ctx.sendMessage(groupId, `🚫 [AUTOMOD] ${senderName || senderJid} removido por divulgação via "este grupo foi mencionado".`);
+        } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar (antistory):', err?.message); }
+      }
+      return {
+        acted: true,
+        reason: 'antistory: mencao de grupo em story',
+        action: 'antistory-ban-kick',
+        moderationState: { ...makeModerationState({ detected: true, actionPlanned: true, deleteRequested: true }), ...moderationStateFromDeleteOutcome(storyDelete) },
+      };
+    }
+
+    // 3. Auditoria: registrar entrada do membro (se ainda não registrado)
+  // 3. Flag de spam: palavra-chave presente?
+    // 4. Contexto de spam: link suspeito / fingerprint repetido / foreign
+    // 5. Exibir nome do remetente (para anti-bot)
+  const hasSpamKeyword = containsSpamKeyword(text);
+  // 6. Contexto de spam: link suspeito / fingerprint repetido / foreign
+    // INC-008: repetição <60s — computada UMA vez; alimenta o antispam
+    // (spamContext) e o sinal 'repeticao' do score antibot.
+    let recentRepeatCount = 0;
+    if (fp) {
+      try { recentRepeatCount = await getRecentFingerprintCount(groupId, fp, senderJid, 60); }
+      catch { /* ignorar */ }
+    }
+    let spamContext = false;
+    if (isForeignNumber(senderJid)) spamContext = true;
+    if (isSuspiciousDomain(domains)) spamContext = true;
+    if (recentRepeatCount >= 2) spamContext = true;
+    // Registrar fingerprint (para detecção de repetidas futuras)
+    if (fp) {
+      try {
+        await recordMessageFingerprint(groupId, fp, senderJid);
+      } catch { /* ignorar */ }
+    }
+
+  // 7. Exibir nome do remetente (para anti-bot)
+    const suspiciousName = isSuspiciousDisplayName(senderName);
+
+    // ─── Sinais Estruturais AntiBot ──────────────────────────────────────────
+    const structuralSignals = extractAntiBotSignals(msg);
+
+    // ─── ORQUESTRAÇÃO DE REGRAS ──────────────────────────────────────────────
+    const reportedActions: string[] = [];
+    const msgType = msg.message ?? {};
+
+    // REGRA 1: antiestrangeiro (absoluto) — ban+remove+delete de TODO não-brasileiro
+      if (config.antiestrangeiro && isForeignSender(msg, senderJid)) {
+        const reasonText = `${senderName || senderJid} — DDI estrangeiro (anti-estrangeiro).`;
+        reportedActions.push(`ANTIESTRANGEIRO: ${reasonText}`);
+        ctx.log(`[AutoMod] antiestrangeiro ativado: ${reasonText}`);
+
+        // Blindagem: ID protegido não é banido/removido/deletado
+        if (isProtectedTarget(senderJid)) {
+          ctx.log(`[AutoMod] antiestrangeiro ignorado — ID protegido: ${senderJid}`);
+          return { acted: false, reason: 'antiestrangeiro: ID protegido', action: 'none', moderationState: makeModerationState({ detected: true }) };
+        }
+
+        // Audit-only mode: apenas registrar, não executar ações
+        if (isAuditOnly) {
+          ctx.log(`[AutoMod] AUDIT-ONLY antiestrangeiro: ${senderJid} seria banido/removido/deletado`);
+          return { acted: false, reason: 'antiestrangeiro: audit-only', action: 'none', moderationState: makeModerationState({ detected: true, actionPlanned: true, finalState: 'AUDIT_ONLY' }) };
+        }
+
+      // Ban persistente
+      if (config.remover) {
+        try {
+          await banUser({ groupId, userId: senderJid, reason: 'banido-autoestrangeiro' });
+          ctx.log(`[AutoMod] ban persistente registrado para ${senderJid}`);
+        } catch (err: any) { ctx.warn('[AutoMod] erro ao banir:', err?.message); }
+
+        // Remove do grupo
+        try {
+          await ctx.removeParticipant(groupId, senderJid);
+          ctx.log(`[AutoMod] removido do grupo: ${senderJid}`);
+          reportedActions.push(`REMOVIDO`);
+        } catch (err: any) {
+          ctx.warn(`[AutoMod] erro ao remover ${senderJid}:`, err?.message);
+          reportedActions.push(`FALHA AO REMOVER (${err?.message || 'erro'})`);
+        }
+      }
+
+      // Delete mensagem (se bot for admin) — antiestrangeiro sempre deleta
+      const deleteOutcome = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+      const deleteSuccess = deleteOutcome.finalState === 'PASS';
+      if (deleteSuccess) {
+        ctx.log(`[AutoMod] mensagem deletada e confirmada de ${senderJid}`);
+        reportedActions.push(`MSGMENSAGEMAPAGADA`);
+        await recordInfraction(groupId, senderJid).catch(err => ctx.warn('[AutoMod] erro ao registrar infração:', err?.message));
+      } else {
+        ctx.warn(`[AutoMod] delete não confirmado (${deleteOutcome.finalState})`, deleteOutcome.error);
+      }
+
+            // Anunciar somente quando o delete foi confirmado.
+            if (config.detectar === true && deleteSuccess) {
+              const hasRealAction = reportedActions.some(a => a === 'REMOVIDO' || a === 'MSGMENSAGEMAPAGADA');
+              if (hasRealAction) {
+                const ann = reportedActions.join(' | ');
+                try {
+                  await ctx.sendMessage(groupId, `🚫 [AUTOMOD] ${ann}: ${senderName || senderJid} (${senderJid})`);
+                } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar:', err?.message); }
+              }
+            }
+
+            return {
+              acted: deleteSuccess,
+              reason:`antiestrangeiro: ${reportedActions.join('; ')}`,
+              action:'ban+remove+delete+announce',
+              moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(deleteOutcome) },
+            };
+          }
+
+  // REGRA 2: anti-bot (remover) — combinação de sinais INDEPENDENTES
+    // Threshold: >=2 sinais independentes → ban+remove+delete+announce
+    // REGRA 2b: anti-bot cassino (alta probabilidade) — classificador dedicado
+    //
+    // ⚠️ REGRA ANTI-DUPLA-CONTAGEM
+    // Uma mesma propriedade da mensagem NÃO pode virar duas evidências.
+    // A estrutura (buttons/list/template/interactive/product) é UMA categoria:
+    // por mais tipos que o payload traga, conta como UM sinal.
+    // Ex.: estrutura + nome-suspeito = 2 sinais independentes → dispara.
+    //      estrutura + buttonsMessage  = 1 sinal estrutural    → NÃO dispara.
+    const botSignals: string[] = [];
+    // DDI estrangeiro — usa o PN (o LID não carrega DDI). Fonte ÚNICA: antes
+    // havia também um `isForeignNumber(senderJid)` aqui, que em grupos @lid
+    // retornava false e criava duas fontes para o mesmo fato.
+    if (isForeignSender(msg, senderJid)) botSignals.push('foreign');
+    if (isSuspiciousDomain(domains)) botSignals.push('link-suspeito');
+    if (suspiciousName) botSignals.push('nome-suspeito');
+    if (hasSpamKeyword) botSignals.push('spam-keyword');
+    if (recentRepeatCount >= 2) botSignals.push('repeticao'); // INC-008: repetição <60s
+
+    // Estrutura de bot = UMA categoria = NO MÁXIMO UM sinal.
+    // structuralSignals pode listar vários tipos, mas todos pertencem à mesma
+    // categoria (mensagem estruturada de bot) → 1 evidência, com os tipos no
+    // nome para auditoria.
+    if (structuralSignals.length > 0) {
+      botSignals.push(`estrutura-bot(${structuralSignals.join('+')})`);
+    }
+
+    // Rede de segurança: nenhum sinal duplicado entra na contagem.
+    const uniqueSignals = [...new Set(botSignals)];
+    if (uniqueSignals.length !== botSignals.length) {
+      ctx.warn(`[AutoMod] sinais duplicados removidos: ${botSignals.join(', ')}`);
+    }
+    botSignals.length = 0;
+    botSignals.push(...uniqueSignals);
+
+  // REGRA 2b: Cassino de alta probabilidade — usa classificador multi-sinal
+  // Threshold normal: confiança >= 60 E >= 3 sinais.
+  // Combinação forte: domínio de cassino + (keywords OU estrutura interativa).
+  //   Existe porque o threshold numérico foi calibrado contando com o sinal
+  //   `foreign-number`, que NÃO existe em grupos @lid (LID não carrega DDI).
+  //   Sem isso, spam textual de cassino de remetente brasileiro passava.
+  const casinoDetection = classifyCasino(msg, senderJid, senderName);
+  const isHighProbabilityCasino =
+    config.casino === true &&
+    casinoDetection.detected &&
+    (casinoDetection.strongCombo ||
+     (casinoDetection.confidence >= 60 && casinoDetection.signals.length >= 3));
+
+  if (isHighProbabilityCasino) {
+    const reasonText = `${senderName || senderJid} — CASSINO/BETANO ALTA PROBABILIDADE: ${casinoDetection.reason}.`;
+    reportedActions.push(`ANTIBOT-CASINO: ${reasonText}`);
+    ctx.log(`[AutoMod] ⚠️ CASSINO ALTA PROBABILIDADE detectado: ${reasonText}`);
+
+    // Blindagem: ID protegido não é banido/removido/deletado
+    if (isProtectedTarget(senderJid)) {
+      ctx.log(`[AutoMod] cassino ignorado — ID protegido: ${senderJid}`);
+      return { acted: false, reason: 'cassino: ID protegido', action: 'none', moderationState: makeModerationState({ detected: true }) };
+    }
+
+    // Admin do grupo: nunca é punido automaticamente. Verificado ANTES do
+    // audit_only para que a proteção apareça no log mesmo em modo auditoria.
+    try {
+      const chat = await ctx.getChat(groupId);
+      if (isSenderGroupAdmin(chat, senderJid)) {
+        ctx.log(`[AutoMod] cassino ignorado — remetente é admin: ${senderJid}`);
+        return { acted: false, reason: 'cassino: remetente é admin', action: 'none', moderationState: makeModerationState({ detected: true }) };
+      }
+    } catch { /* ignorar */ }
+
+    if (isAuditOnly) {
+      ctx.log(`[AutoMod] AUDIT-ONLY cassino: ${senderJid} seria banido/removido/deletado (sinais: ${casinoDetection.signals.join(', ')})`);
+      return { acted: false, reason: 'cassino: audit-only', action: 'none', moderationState: makeModerationState({ detected: true, actionPlanned: true, finalState: 'AUDIT_ONLY' }) };
+    }
+
+    // Ban persistente
+    try {
+      await banUser({ groupId, userId: senderJid, reason: 'banido-cassino-alta-probabilidade' });
+      ctx.log(`[AutoMod] ban persistente (cassino) registrado para ${senderJid}`);
+    } catch (err: any) { ctx.warn('[AutoMod] erro ao banir (cassino):', err?.message); }
+
+    // Remove do grupo
+    try {
+      await ctx.removeParticipant(groupId, senderJid);
+      ctx.log(`[AutoMod] removido do grupo (cassino): ${senderJid}`);
+      reportedActions.push(`REMOVIDO`);
+    } catch (err: any) {
+      ctx.warn(`[AutoMod] erro ao remover ${senderJid}:`, err?.message);
+      reportedActions.push(`FALHA AO REMOVER (${err?.message || 'erro'})`);
+    }
+
+    // Delete mensagem
+    const casinoDeleteOutcome = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+    const casinoDeleteSuccess = casinoDeleteOutcome.finalState === 'PASS';
+    if (casinoDeleteSuccess) {
+      ctx.log(`[AutoMod] mensagem deletada e confirmada (cassino): ${senderJid}`);
+      reportedActions.push(`MSGMENSAGEMAPAGADA`);
+      await recordInfraction(groupId, senderJid).catch(err => ctx.warn('[AutoMod] erro ao registrar infração (cassino):', err?.message));
+    } else {
+      ctx.warn(`[AutoMod] delete cassino não confirmado (${casinoDeleteOutcome.finalState})`, casinoDeleteOutcome.error);
+    }
+
+    // Anunciar — só se houve ação real
+    if (config.detectar === true && casinoDeleteSuccess) {
+      const hasRealAction = reportedActions.some(a => a === 'REMOVIDO' || a === 'MSGMENSAGEMAPAGADA');
+      if (hasRealAction) {
+        try {
+          await ctx.sendMessage(groupId, `🚫 [AUTOMOD-CASINO] Removido/banido/deletado: ${senderName || senderJid} (${senderJid}) — sinais: ${casinoDetection.signals.join(', ')}`);
+        } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar (cassino):', err?.message); }
+      }
+    }
+
+    return {
+      acted: casinoDeleteSuccess,
+      reason: `cassino-alta-probabilidade: ${casinoDetection.signals.join(', ')} → ${reportedActions.join('; ')}`,
+      action: 'ban+remove+delete+announce',
+      moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(casinoDeleteOutcome) },
+    };
+  }
+
+  // REGRA 2c: anti-bot — SCORE SOMATÓRIO (INC-008) + combo especial.
+  // v0 era `botSignals.length >= 2 → ban+remove+delete+announce`.
+  // v1: somaPesos() com thresholds graduados; ban/remove SÓ no combo
+  // (estrutura-bot + foreign + primeira mensagem pós-join).
+  if (config.antibot === true && botSignals.length > 0) {
+    const score = somaPesos(botSignals);
+
+    // Blindagem: ID protegido não sofre nenhuma ação (nem delete).
+    if (isProtectedTarget(senderJid)) {
+      ctx.log(`[AutoMod] antibot ignorado — ID protegido: ${senderJid}`);
+      return { acted: false, reason: 'antibot: ID protegido', action: 'none', moderationState: makeModerationState({ detected: true }) };
+    }
+
+    // Admin do grupo: nunca é punido automaticamente. Verificado ANTES do
+    // audit_only — mesma blindagem da REGRA 2b (cassino). Um admin legítimo
+    // não pode ser banido por mandar uma mensagem estruturada.
+    try {
+      const chat = await ctx.getChat(groupId);
+      if (isSenderGroupAdmin(chat, senderJid)) {
+        ctx.log(`[AutoMod] antibot ignorado — remetente é admin: ${senderJid}`);
+        return { acted: false, reason: 'antibot: remetente é admin', action: 'none', moderationState: makeModerationState({ detected: true }) };
+      }
+    } catch { /* ignorar */ }
+
+    // Score baixo: calibração — sem ação; segue para as outras regras.
+    if (score < 6) {
+      ctx.log(`[AutoMod] antibot score ${score} < 6 — sem ação (${botSignals.join(', ')})`);
+    } else {
+      // Auditoria: sinais + score sempre no log quando há ação (v0 fazia
+      // isso na entrada; o v1 mantém — antibotDoubleCount depende disso).
+      ctx.log(`[AutoMod] antibot ativado: ${senderName || senderJid} — score ${score} (${botSignals.join(', ')})`);
+
+      // Audit-only: loga (com score), não age em NENHUM threshold.
+      if (isAuditOnly) {
+        ctx.log(`[AutoMod] AUDIT-ONLY antibot: ${senderJid} score ${score} (${botSignals.join(', ')}) — não age`);
+        return { acted: false, reason: `antibot: audit-only (score ${score})`, action: 'none', moderationState: makeModerationState({ detected: true, actionPlanned: true, finalState: 'AUDIT_ONLY' }) };
+      }
+
+      // ─── COMBO ESPECIAL: estrutura-bot + foreign + 1ª msg pós-join ───
+      // Única via de ban/remove automático do antibot v1.
+      const hasEstruturaBot = botSignals.some((s) => s.startsWith('estrutura-bot'));
+      const hasForeign = botSignals.includes('foreign');
+      if (hasEstruturaBot && hasForeign && consumeFirstMessage(groupId, senderJid)) {
+        // Ajuste 1 (aprovado): delete PRIMEIRO. Sem delete confirmado NÃO
+        // há ban/kick — expulsar deixando a mensagem viva piora o grupo.
+        const comboDeleteOutcome = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+        if (comboDeleteOutcome.finalState !== 'PASS') {
+          ctx.warn(`[AutoMod] COMBO: delete não confirmado (${comboDeleteOutcome.finalState}) — NÃO banindo/kickando (admin decide manualmente)`,
+            { senderJid, groupId, sinais: botSignals.join(', ') });
+          reportedActions.push(`ANTIBOT-COMBO: delete falhou (${comboDeleteOutcome.finalState})`);
+          return {
+            acted: false,
+            reason: `antibot combo delete-failed (${comboDeleteOutcome.finalState}): ${botSignals.join(', ')}`,
+            action: 'combo-delete-failed',
+            moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(comboDeleteOutcome) },
+          };
+        }
+        ctx.log(`[AutoMod] combo confirmado (score ${score}): delete OK — banindo e removendo ${senderJid}`);
+        reportedActions.push('ANTIBOT-COMBO: card+foreign+primeira-msg');
+        try {
+          await banUser({ groupId, userId: senderJid, reason: 'banido-antibot-card-foreign-first' });
+          ctx.log(`[AutoMod] ban persistente (combo) registrado para ${senderJid}`);
+        } catch (err: any) { ctx.warn('[AutoMod] erro ao banir (combo):', err?.message); }
+        try {
+          await ctx.removeParticipant(groupId, senderJid);
+          ctx.log(`[AutoMod] removido do grupo (combo): ${senderJid}`);
+          reportedActions.push('REMOVIDO');
+        } catch (err: any) {
+          ctx.warn(`[AutoMod] erro ao remover ${senderJid} (combo):`, err?.message);
+          reportedActions.push(`FALHA AO REMOVER (${err?.message || 'erro'})`);
+        }
+        if (config.detectar === true) {
+          try {
+            await ctx.sendMessage(groupId, `🤖 [AUTOMOD] Bot expulso: ${senderName || senderJid} (${senderJid}) — card + número estrangeiro na primeira mensagem.`);
+          } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar (combo):', err?.message); }
+        }
+        await recordInfraction(groupId, senderJid).catch((err) => ctx.warn('[AutoMod] erro ao registrar infração (combo):', err?.message));
+        return {
+          acted: true,
+          reason: `antibot combo: ${botSignals.join(', ')}`,
+          action: 'combo-first-message: delete+ban+remove+announce+infraction',
+          moderationState: makeModerationState({ detected: true, actionPlanned: true, deleteConfirmed: true, finalState: 'PASS' }),
+        };
+      }
+
+      // ─── THRESHOLDS GRADUADOS (delete + ação por faixa; SEM ban/kick) ───
+      const thresholdDelete = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+      if (thresholdDelete.finalState !== 'PASS') {
+        ctx.warn(`[AutoMod] delete antibot (score ${score}) não confirmado (${thresholdDelete.finalState})`, thresholdDelete.error);
+        return {
+          acted: false,
+          reason: `antibot score ${score}: delete não confirmado (${thresholdDelete.finalState}) — ${botSignals.join(', ')}`,
+          action: `score-${score}: delete-failed`,
+          moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(thresholdDelete) },
+        };
+      }
+      ctx.log(`[AutoMod] mensagem deletada e confirmada (antibot score ${score}): ${senderJid}`);
+
+      if (score >= 10) {
+        // >=10: evidência completa — admin decide manualmente.
+        ctx.warn(`[AutoMod] ⚠️ ANTIBOT score ${score} ≥ 10 — evidência para admin decidir`,
+          { senderId: senderJid, groupId, senderName, sinais: botSignals.join(', '), score, delete: 'PASS' });
+        reportedActions.push(`ANTIBOT-SCORE${score}: evidência registrada (admin decide)`);
+      } else if (score >= 8) {
+        // 8-9: delete + announce público (sem punição).
+        if (config.detectar === true) {
+          try {
+            await ctx.sendMessage(groupId, `🤖 [AUTOMOD] Mensagem de bot removida: ${senderName || senderJid} (${senderJid}) — sinais: ${botSignals.join(', ')} (score ${score}).`);
+          } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar (score 8-9):', err?.message); }
+        }
+        reportedActions.push(`ANTIBOT-SCORE${score}: delete+announce`);
+      } else {
+        // 6-7: delete + infraction silenciosa.
+        await recordInfraction(groupId, senderJid).catch((err) => ctx.warn('[AutoMod] erro ao registrar infração (score 6-7):', err?.message));
+        reportedActions.push(`ANTIBOT-SCORE${score}: delete+infraction`);
+      }
+
+      return {
+        acted: true,
+        reason: `antibot score ${score}: ${botSignals.join(', ')} → ${reportedActions.join('; ')}`,
+        action: `score-${score}: delete${score >= 10 ? '+evidência-admin' : score >= 8 ? '+announce' : '+infraction'}`,
+        moderationState: makeModerationState({ detected: true, actionPlanned: true, deleteConfirmed: true, finalState: 'PASS' }),
+      };
+    }
+  }
+
+  // REGRA 3: anti-link (autolink) — delete mensagem + announce (sem ban)
+      if (config.autolink && isSuspiciousDomain(domains)) {
+        // Compute urlList first for audit logging
+        const urlList = [...new Set(domains.filter(d => SUSPICIOUS_DOMAINS.some(s => d.includes(s))))].join(', ');
+
+        // Blindagem: ID protegido não tem mensagem deletada
+        if (isProtectedTarget(senderJid)) {
+          ctx.log(`[AutoMod] antilink ignorado — ID protegido: ${senderJid}`);
+          return { acted: false, reason: 'antilink: ID protegido', action: 'none', moderationState: makeModerationState({ detected: true }) };
+        }
+
+        // Audit-only mode: apenas registrar, não executar ações
+        if (isAuditOnly) {
+          ctx.log(`[AutoMod] AUDIT-ONLY antilink: mensagem de ${senderJid} seria deletada (domínios: ${urlList})`);
+          return { acted: false, reason: 'antilink: audit-only', action: 'none', moderationState: makeModerationState({ detected: true, actionPlanned: true, finalState: 'AUDIT_ONLY' }) };
+        }
+      reportedActions.push(`ANTILINK: domínio(s) suspeito(s) ${urlList} em ${senderJid}`);
+      ctx.log(`[AutoMod] antilink ativado: domínios ${urlList} de ${senderJid}`);
+
+      // Delete mensagem
+      const antilinkDeleteOutcome = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+      const antilinkDeleteSuccess = antilinkDeleteOutcome.finalState === 'PASS';
+      if (antilinkDeleteSuccess) {
+        ctx.log(`[AutoMod] mensagem deletada e confirmada por antilink: ${senderJid}`);
+        reportedActions.push(`MSGMENSAGEMAPAGADA`);
+      } else {
+        ctx.warn(`[AutoMod] delete antilink não confirmado (${antilinkDeleteOutcome.finalState})`, antilinkDeleteOutcome.error);
+      }
+
+      // Anunciar se detectar on — só se deletou com sucesso
+      if (config.detectar === true && antilinkDeleteSuccess) {
+        try {
+          await ctx.sendMessage(
+            groupId,
+            `🔗 [AUTOMOD] Mensagem removida (link suspeito): ${senderName || senderJid} (${senderJid}) — domínios: ${urlList}`
+          );
+        } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar:', err?.message); }
+      }
+
+      return {
+        acted: antilinkDeleteSuccess,
+        reason:`antilink: domínios ${urlList}`,
+        action:'delete+announce',
+        moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(antilinkDeleteOutcome) },
+      };
+    }
+
+  // REGRA 4: anti-spam (antispam) — palavra-chave + contexto → delete mensagem + announce
+    // Palavra-chave ISOLADA (sem contexto) NÃO dispara ação, conforme solicitação.
+    if (config.antispam && hasSpamKeyword && spamContext) {
+      // Blindagem: ID protegido não tem mensagem deletada
+            if (isProtectedTarget(senderJid)) {
+              ctx.log(`[AutoMod] antispam ignorado — ID protegido: ${senderJid}`);
+              return { acted: false, reason: 'antispam: ID protegido', action: 'none', moderationState: makeModerationState({ detected: true }) };
+            }
+
+            // Audit-only mode: apenas registrar, não executar ações
+            if (isAuditOnly) {
+              ctx.log(`[AutoMod] AUDIT-ONLY antispam: mensagem de ${senderJid} seria deletada`);
+              return { acted: false, reason: 'antispam: audit-only', action: 'none', moderationState: makeModerationState({ detected: true, actionPlanned: true, finalState: 'AUDIT_ONLY' }) };
+            }
+
+      const snippet = text.slice(0, 40);
+      reportedActions.push(`ANTISPAM: palavra-chave "${snippet}${text.length > 40 ? '...' : ''}" em ${senderJid}`);
+      ctx.log(`[AutoMod] antispam ativado: anti-spam keyword + contexto → delete+announce`);
+
+      // Delete mensagem
+      const antispamDeleteOutcome = await requestModerationDelete(buildDeleteKey(msg, senderJid));
+      const antispamDeleteSuccess = antispamDeleteOutcome.finalState === 'PASS';
+      if (antispamDeleteSuccess) {
+        ctx.log(`[AutoMod] mensagem deletada e confirmada por antispam: ${senderJid}`);
+        reportedActions.push(`MSGUPDELETE`);
+      } else {
+        ctx.warn(`[AutoMod] delete antispam não confirmado (${antispamDeleteOutcome.finalState})`, antispamDeleteOutcome.error);
+      }
+
+      // Anunciar se detectar on
+            if (config.detectar === true && antispamDeleteSuccess) {
+              const ann = reportedActions.join(' | ');
+              try {
+                await ctx.sendMessage(
+                  groupId,
+                  `📢 [AUTOMOD] Mensagem removida (spam detectado): ${senderName || senderJid} (${senderJid})`
+                );
+              } catch (err: any) { ctx.warn('[AutoMod] erro ao anunciar:', err?.message); }
+            }
+
+            // Registrar infração somente após confirmação real.
+            if (antispamDeleteSuccess) {
+              await recordInfraction(groupId, senderJid).catch(err => ctx.warn('[AutoMod] erro ao registrar infração:', err?.message));
+            }
+
+            return {
+              acted: antispamDeleteSuccess,
+              reason:`antispam: ${reportedActions.join('; ')}`,
+              action:'delete+announce',
+              moderationState: { ...makeModerationState({ detected: true, actionPlanned: true }), ...moderationStateFromDeleteOutcome(antispamDeleteOutcome) },
+            };
+          }
+
+  // Nada ativado que precise agir
+  ctx.log(`[AutoMod] sem ações: config=${JSON.stringify(config)} foreign=${isForeignNumber(senderJid)} spamKW=${hasSpamKeyword} spamCtx=${spamContext} domain=${isSuspiciousDomain(domains)} botSig=${botSignals.length}`);
+  return { acted:false, reason:'sem ações', action:'none', moderationState: makeModerationState() };
+}
+
+// ─── Cleanup periódico (chamar a cada N min via setInterval no entry point) ──
+export async function runPeriodicCleanup(): Promise<void> {
+  try {
+    await cleanupOldFingerprintEntries(3600); // 1h
+    await cleanupOldJoinEntries(2592000);   // 30d
+  } catch (err: any) {
+    logWarning('[autoModEngine] runPeriodicCleanup falhou:', err?.message);
+  }
+}

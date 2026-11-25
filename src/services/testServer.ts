@@ -1,0 +1,2196 @@
+import { randomUUID } from 'node:crypto';
+import { findMessageCapture, readCaptures as readPersistedCaptures } from './captureStore';
+import { isMaster, getMasterUser } from './permissions';
+import { type DeleteConfirmation } from './deleteE2EConfirmation';
+import { requestConfirmedDelete } from './deleteConfirmationService';
+import { persistDeleteE2EResult } from './deleteE2EResult';
+import http from 'node:http';
+import { PlatformManager } from '../platforms/PlatformManager';
+import { logInfo, logWarning, logError } from './loggerService';
+import { markRecentJoin } from './recentJoinTracker.js';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// ─── Lab: endpoints de injeção (Rodada 4a) ──────────────────────────────────
+// Grupo único autorizado. Hardcoded de propósito: é lab, não feature. Qualquer
+// outro JID é rejeitado com 403 ANTES de tocar em adapter/socket — impede uso
+// acidental contra grupo real.
+export const LAB_GROUP_ID = '120363410094452673@g.us';
+
+/**
+ * INC-008: montagem da mensagem fake do /lab/antibot-test — pura, testável
+ * sem HTTP. extraText entra como conversation ADICIONAL junto do card: o
+ * extractTextFromWAMessage concatena os tipos (F2.5.1), então link/keyword
+ * no extraText pontuam link-suspeito/spam-keyword no score.
+ */
+export function buildAntiBotTestMessage(
+  messageType: string,
+  text: string | undefined,
+  extraText?: string,
+  footer?: string,
+): any {
+  const msgObj: any = {};
+  const t = messageType || 'buttonsMessage';
+  // ⚠️ NÃO injetar footer de cassino por padrão: isso adicionava
+  // `casino-domain` a TODO buttonsMessage e contaminava os testes
+  // negativos (botão legítimo virava "cassino"). O footer só entra
+  // se o caller passar `footer` explicitamente.
+  if (t === 'buttonsMessage') {
+    msgObj.buttonsMessage = {
+      contentText: text || 'spam',
+      ...(footer ? { footerText: footer } : {}),
+      buttons: [{ buttonId: '1', buttonText: { displayText: 'go' }, type: 1 }],
+    };
+  } else if (t === 'interactiveMessage') {
+    msgObj.interactiveMessage = {
+      body: { text: text || 'spam' },
+      nativeFlowMessage: { buttons: [{ name: 'cta_url', buttonParamsJson: '{"display_text":"go"}' }] },
+    };
+  } else if (t === 'listMessage') {
+    msgObj.listMessage = { title: 'L', description: text || 'spam', buttonText: 'go', sections: [] };
+  } else {
+    msgObj.conversation = text || 'spam';
+  }
+  if (extraText) {
+    msgObj.conversation = msgObj.conversation
+      ? `${msgObj.conversation}\n${extraText}`
+      : extraText;
+  }
+  return msgObj;
+}
+
+export class LabError extends Error {
+  constructor(message: string, public readonly status: 400 | 403 | 404 | 500) {
+    super(message);
+    this.name = 'LabError';
+  }
+}
+
+/** Superfície mínima do adapter que os endpoints de injeção precisam. */
+export interface LabAdapterLike {
+  handleGroupParticipantsUpdate?: (event: any) => Promise<void> | void;
+  normalizer?: { dispatchMessage?: (rawMsg: any) => Promise<void> | void };
+}
+
+/**
+ * Endpoint A — injeta um evento de participante no MESMO handler de produção
+ * (BaileysAdapter.handleGroupParticipantsUpdate).
+ *   action='add'    → memberJoinService (bem-vindo)
+ *   action='remove' → feedbackService.recordExitEvent (feedback de saída)
+ */
+export async function injectParticipantEvent(
+  adapter: LabAdapterLike | null | undefined,
+  body: { groupId?: unknown; userId?: unknown; action?: unknown },
+): Promise<{ ok: true }> {
+  if (body.groupId !== LAB_GROUP_ID) {
+    throw new LabError(`Grupo não permitido. Lab só aceita ${LAB_GROUP_ID}`, 403);
+  }
+  if (!body.userId || (body.action !== 'add' && body.action !== 'remove')) {
+    throw new LabError('Missing userId ou action inválida (use add|remove)', 400);
+  }
+  if (!adapter || typeof adapter.handleGroupParticipantsUpdate !== 'function') {
+    throw new LabError('Adapter WhatsApp não encontrado', 404);
+  }
+  await adapter.handleGroupParticipantsUpdate({
+    id: body.groupId,
+    action: body.action,
+    participants: [body.userId],
+  });
+  return { ok: true };
+}
+
+/**
+ * Endpoint B — injeta uma mensagem pelo NORMALIZER real
+ * (BaileysMessageNormalizer.dispatchMessage), o mesmo pipeline de produção.
+ * Passa por: mute check → coleta de apresentações → sarcasmo → comandos.
+ *
+ * fromMe=false de propósito: simula usuário comum, nunca o bot.
+ *
+ * DESVIO DE DESENHO: o spec pedia PlatformManager.handleIncomingMessage, mas
+ * esse caminho retorna cedo para texto sem prefixo '$' (PlatformManager.ts:291)
+ * e por isso NÃO alcançaria sarcasmo nem mute. O normalizer é o ponto de entrada
+ * que cobre os três (sarcasmo, mute e comandos) numa única chamada.
+ *
+ * ATENÇÃO: o normalizer também dispara o AutoMod (fire-and-forget) e grava no
+ * capture-store. Mensagens injetadas passam por TUDO, como uma real.
+ */
+export async function injectMessage(
+  adapter: LabAdapterLike | null | undefined,
+  body: {
+    groupId?: unknown;
+    senderId?: unknown;
+    text?: unknown;
+    mentions?: string[];
+    /** ID (stanzaId) da mensagem citada — simula reply do novato ao aviso do bot. */
+    quotedStanzaId?: string;
+    /** Participant da mensagem citada (JID do autor original). */
+    quotedParticipant?: string;
+    /** Texto da mensagem citada (reconstruído no contextInfo). */
+    quotedText?: string;
+  },
+): Promise<{ ok: true; messageId: string }> {
+  if (body.groupId !== LAB_GROUP_ID) {
+    throw new LabError(`Grupo não permitido. Lab só aceita ${LAB_GROUP_ID}`, 403);
+  }
+  if (!body.senderId || !body.text) {
+    throw new LabError('Missing senderId ou text', 400);
+  }
+  const normalizer = adapter?.normalizer;
+  if (!normalizer || typeof normalizer.dispatchMessage !== 'function') {
+    throw new LabError('Normalizer do adapter WhatsApp indisponível', 404);
+  }
+  const dispatch = normalizer.dispatchMessage;
+  const messageId = `lab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // contextInfo: mentions e/ou quote (reply). O normalizer extrai
+  // replyToMessageId/quotedText do contextInfo — mesmo formato do wire.
+  const contextInfo: Record<string, unknown> = {};
+  if (body.mentions && body.mentions.length > 0) {
+    contextInfo.mentionedJidList = body.mentions;
+  }
+  if (body.quotedStanzaId) {
+    contextInfo.stanzaId = String(body.quotedStanzaId);
+    if (body.quotedParticipant) contextInfo.participant = String(body.quotedParticipant);
+    contextInfo.quotedMessage = { conversation: String(body.quotedText ?? '') };
+  }
+  const message: Record<string, unknown> =
+    Object.keys(contextInfo).length > 0
+      ? { extendedTextMessage: { text: body.text, contextInfo } }
+      : { conversation: body.text };
+  await dispatch.call(normalizer, {
+    key: { id: messageId, remoteJid: body.groupId, fromMe: false, participant: body.senderId },
+    message,
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    pushName: 'LabInject',
+  });
+  return { ok: true, messageId };
+}
+
+// ─── Contadores de estatísticas ─────────────────────────────────────────────
+let totalAttempts = 0;
+let totalSuccess = 0;
+
+/** Procura por contextInfo em qualquer nível de um objeto de mensagem */
+function findContextInfoInMessage(msg: any): any[] {
+  const results: any[] = [];
+  if (!msg || typeof msg !== 'object') return results;
+  for (const key of Object.keys(msg)) {
+    const val = msg[key];
+    if (val && typeof val === 'object' && val.contextInfo !== undefined) {
+      results.push({
+        path: `message.${key}.contextInfo`,
+        stanzaId: val.contextInfo.stanzaId || null,
+        quotedMessage: val.contextInfo.quotedMessage ? 'present' : null,
+        hasQuotedMessage: !!val.contextInfo.quotedMessage,
+        contextInfoKeys: Object.keys(val.contextInfo),
+      });
+    }
+    if (val && typeof val === 'object') {
+      results.push(...findContextInfoInMessage(val));
+    }
+  }
+  return results;
+}
+
+/** Inspeção recursiva completa da mensagem de resposta */
+function inspectMessageRecursively(msg: any, path: string = 'message'): any[] {
+  const results: any[] = [];
+  if (!msg || typeof msg !== 'object') return results;
+
+  if (msg.contextInfo) {
+    results.push({
+      path,
+      stanzaId: msg.contextInfo.stanzaId || null,
+      quotedMessage: msg.contextInfo.quotedMessage ? 'present' : null,
+      hasQuotedMessage: !!msg.contextInfo.quotedMessage,
+      contextInfoKeys: Object.keys(msg.contextInfo),
+      contextInfo: msg.contextInfo,
+    });
+  }
+
+  for (const key of Object.keys(msg)) {
+    if (key === 'contextInfo' || key === 'stanzaId') continue;
+    const val = msg[key];
+    if (val && typeof val === 'object') {
+      results.push(...inspectMessageRecursively(val, `${path}.${key}`));
+    }
+  }
+  return results;
+}
+
+async function readCaptures(): Promise<Array<Record<string, any>>> {
+  return readPersistedCaptures();
+}
+
+function waitForOutgoingMarker(sock: any, groupJid: string, marker: string, timeoutMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  let resolvePromise: (message: any | null) => void = () => {};
+  const cleanup = () => {
+    if (timer) clearTimeout(timer);
+    sock.ev.off('messages.upsert', onUpsert);
+  };
+  const finish = (message: any | null) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    resolvePromise(message);
+  };
+  const onUpsert = (event: any) => {
+    const match = (event?.messages || []).find((message: any) => {
+      const key = message?.key || {};
+      const body = message?.message?.conversation
+        || message?.message?.extendedTextMessage?.text
+        || '';
+      return key.remoteJid === groupJid && key.fromMe === true && String(body).includes(marker);
+    });
+    if (match) finish(match);
+  };
+  const promise = new Promise<any | null>((resolve) => { resolvePromise = resolve; });
+  sock.ev.on('messages.upsert', onUpsert);
+  timer = setTimeout(() => finish(null), timeoutMs);
+  return { promise, dispose: () => finish(null) };
+}
+
+/**
+ * Executa uma função com WPP_LAB_MODE ativado ('1'), garantindo
+ * restauração do valor anterior em try/finally — mesmo se a função
+ * lançar exceção. Previne vazamento de LAB_MODE para produção.
+ *
+ * Uso:
+ *   await withLabMode(async () => {
+ *     const result = await pm.sendMessageAndProcess(...);
+ *     return result;
+ *   });
+ */
+export async function withLabMode<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.WPP_LAB_MODE;
+  process.env.WPP_LAB_MODE = '1';
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.WPP_LAB_MODE;
+    } else {
+      process.env.WPP_LAB_MODE = previous;
+    }
+  }
+}
+
+/**
+ * Servidor de testes HTTP na porta 3004.
+ * Permite injetar comandos diretamente no bot via POST /test
+ *
+ * Uso: curl -X POST http://localhost:3004/test -d '{"platform":"discord","command":"$menu"}'
+ *
+ * Endpoints de laboratório:
+ *   POST /lab/find-message  - busca grupo pelo nome
+ *   POST /lab/messages     - busca mensagens do grupo
+ *   POST /lab/delete-message - deleta mensagem
+ *   POST /lab/adapter      - status do adapter
+ *   POST /lab/groups       - lista todos os grupos ativos
+ *   GET  /lab/stats        - retorna estatísticas de uso (total_attempts, total_success)
+ *
+ * Nota de arquitetura: o PlatformManager é um singleton, mas o bundler (tsup)
+ * pode instanciar escopos de módulo separados por bundle. A instância "viva"
+ * (com adapters registrados) é publicada em `globalThis.__platformManager` por
+ * multiPlatform.ts. Aqui preferimos `getInstance()`, caindo para o global se o
+ * bundle corrente não compartilhar o mesmo escopo. Isso garante que o testServer
+ * sempre opera sobre a instância real.
+ */
+/**
+ * Sobe o servidor de laboratório. Retorna o `http.Server` para que testes possam
+ * fechá-lo (server.close()) — sem isso o handle ficaria aberto entre suítes.
+ * `port = 0` faz o SO escolher uma porta efêmera; leia de `server.address()`.
+ */
+export function startTestServer(port: number = 3004): http.Server {
+  const server = http.createServer((req, res) => {
+    // Somente POST e GET
+    if (req.method !== 'POST' && req.method !== 'GET') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Only POST/GET allowed' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      try {
+        // Tentar parsear o body como JSON (para todos os endpoints)
+        let parsedBody: any = {};
+        try {
+          parsedBody = JSON.parse(body);
+        } catch {
+          // Se não for JSON, continua como objeto vazio
+        }
+
+        const pm: PlatformManager =
+          (globalThis as any).__platformManager || PlatformManager.getInstance();
+
+        // Helper para obter adapter e socket Baileys com suporte a multi-sessão
+        function getAdapterAndSock(plat: string): { adapter: any; sock: any } {
+          let adapter = pm.getAdapter(plat as any);
+          if (!adapter && (plat === 'whatsapp' || plat.startsWith('whatsapp'))) {
+            // Tenta prefixo
+            const active = pm.getActivePlatforms ? pm.getActivePlatforms() : [];
+            for (const p of active) {
+              if (p.startsWith('whatsapp')) {
+                adapter = pm.getAdapter(p as any);
+                break;
+              }
+            }
+          }
+          const anyAdapter = adapter as any;
+          const sock = anyAdapter ? (anyAdapter.connection?.getSock?.() || anyAdapter.sock || null) : null;
+          return { adapter, sock };
+        }
+
+        // ─── Endpoint para listar todos os grupos ativos (para laboratório) ───
+        if (req.url === '/lab/groups') {
+          const platform = parsedBody.platform || 'whatsapp';
+          const { adapter } = getAdapterAndSock(platform);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          try {
+            const chats = await (adapter as any).getChats?.() || [];
+            const groups = chats.filter((c: any) =>
+              c.isGroup || (c.id && (c.id.endsWith('@g.us') || c.id.startsWith('tg:') || c.id.startsWith('dc:')))
+            );
+            // INC-009: popula meta (nome/descrição) em community_groups —
+            // best-effort; um grupo que falhe não derruba o endpoint.
+            try {
+              const { upsertGroupMeta } = await import('../services/databaseService.js');
+              for (const g of groups as any[]) {
+                try {
+                  await upsertGroupMeta(g.id, g.name ?? null, g.description ?? g.desc ?? null);
+                } catch { /* best-effort por grupo */ }
+              }
+            } catch { /* best-effort geral */ }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, count: groups.length, groups }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── INC-024 F0: inventário de guilds Discord (read-only) ────────
+        // Retorna [{id, name, memberCount}] — o feedback de leave do Discord
+        // opera na GUILD (dc:<guild.id>), não no channel das mensagens.
+        if (req.url === '/lab/discord-guilds') {
+          const { adapter } = getAdapterAndSock('discord');
+          // adapter = PlatformAdapter wrapper; adapter.client = DiscordClient
+          // (wrapper PlatformClient); o client discord.js REAL, dono de
+          // guilds.cache, é adapter.client.client.
+          const dcClient = (adapter as any)?.client?.client;
+          const guildsCache = dcClient?.guilds?.cache;
+          if (!adapter || !guildsCache) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter Discord não encontrado (token não configurado ou client sem guilds)' }));
+            return;
+          }
+          try {
+            const guilds: Array<{ id: string; name: string | null; memberCount: number | null }> = [];
+            for (const g of guildsCache.values()) {
+              guilds.push({ id: String(g.id), name: g.name ?? null, memberCount: g.memberCount ?? null });
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, count: guilds.length, guilds }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── Endpoint para retornar estatísticas de uso ───
+        if (req.url === '/lab/stats') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            stats: {
+              total_attempts: totalAttempts,
+              total_success: totalSuccess,
+            },
+          }));
+          return;
+        }
+
+        // ─── Endpoint de descoberta de grupo (para laboratório) ───
+        // Usa o JSONL de capturas em vez do store do Baileys (store não disponível em rc14).
+        if (req.url === '/lab/find-message') {
+          const { platform, groupName } = parsedBody;
+          if (!platform || !groupName) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform or groupName' }));
+            return;
+          }
+          // Tenta descobrir o JID dinamicamente via getChats primeiro
+          let groupJid = '';
+          const { adapter } = getAdapterAndSock(platform);
+          if (adapter) {
+            try {
+              const chats = await (adapter as any).getChats?.() || [];
+              const found = chats.find((c: any) =>
+                (c.name && c.name.toLowerCase().includes(groupName.toLowerCase())) ||
+                (c.raw?.subject && c.raw.subject.toLowerCase().includes(groupName.toLowerCase()))
+              );
+              if (found) groupJid = found.id;
+            } catch { /* fallback */ }
+          }
+          if (!groupJid) {
+            const knownGroups: Record<string, string> = {
+              'Figurinhas': '120363419033272638@g.us',
+              'Figurinhas/Stickers': '120363419033272638@g.us',
+            };
+            groupJid = knownGroups[groupName] || '5585981344211-1772111940@g.us';
+          }
+          const entries = (await readCaptures()).filter(
+            (c: any) => c.groupId === groupJid || c.remoteJid === groupJid || c.participant === groupJid
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            platform,
+            groupName,
+            groupJid,
+            messageCount: entries.length,
+            chatInfo: { id: groupJid, name: groupName },
+          }));
+          return;
+        }
+
+        // ─── Endpoint de busca de mensagens do grupo (para laboratório) ───
+        // Usa o JSONL de capturas em vez do store do Baileys (store não disponível em rc14).
+        if (req.url === '/lab/messages') {
+          const { platform, groupJid, limit } = parsedBody;
+          if (!platform || !groupJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform or groupJid' }));
+            return;
+          }
+          const entries = (await readCaptures())
+            .filter((c: any) => c.groupId === groupJid || c.remoteJid === groupJid || c.participant === groupJid)
+            .slice(0, limit || 200);
+          const messages: Array<{ key: any; message: any; receivedAt: number }> = entries.map((e: any) => ({
+            key: { id: e.messageId, remoteJid: e.remoteJid, participant: e.participant, fromMe: e.fromMe },
+            message: (e.rawPayloadSafe || {})['message'] || {},
+            receivedAt: e.timestamp,
+          }));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, messages, count: messages.length, groupJid }));
+          return;
+        }
+
+        if (req.url === '/lab/delete-e2e') {
+          const groupJid = '120363410094452673@g.us';
+          const chatId = `wpp:${groupJid}`;
+          const correlationId = randomUUID();
+          const marker = `[LAB_DELETE_TEST:${correlationId}] mensagem temporaria de teste`;
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock?.ev || !adapter.client?.isReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'DELETE E2E FAIL', cause: 'Adapter/socket WhatsApp indisponivel' }));
+            return;
+          }
+          const master = process.env.MASTER_USER;
+          if (!master || !isMaster(master)) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'DELETE E2E FAIL', cause: 'MASTER_USER configurado nao e reconhecido como MASTER' }));
+            return;
+          }
+
+          let targetKey: any = null;
+          let sentMessageId: string | null = null;
+          let messageCreated = false;
+          let capture: any = null;
+          let commandState: { stage: string; details?: any } = { stage: 'not-dispatched' };
+          let confirmation: DeleteConfirmation | null = null;
+          let confirmationTimedOut = false;
+          let deleteOutcome: Awaited<ReturnType<typeof requestConfirmedDelete>> | null = null;
+          let failureCause = '';
+          const markerWaiter = waitForOutgoingMarker(sock, groupJid, marker, 10000);
+
+          try {
+            const sent = await adapter.client.sendMessage(chatId, marker);
+            messageCreated = true;
+            const sentRaw: any = sent?.raw || null;
+            const sentKey: any = sentRaw?.key || null;
+            sentMessageId = sentKey?.id || null;
+            if (!sentKey?.id || sentKey.remoteJid !== groupJid || sentKey.fromMe !== true) {
+              throw new Error('Baileys nao retornou a WAMessageKey real esperada para a mensagem de teste');
+            }
+            targetKey = sentKey;
+
+            const upsertMessage = await markerWaiter.promise;
+            if (!upsertMessage) throw new Error('Timeout aguardando messages.upsert da mensagem UUID');
+            if (upsertMessage.key?.id !== sentKey.id || upsertMessage.key?.remoteJid !== groupJid) {
+              throw new Error('messages.upsert nao corresponde a WAMessageKey retornada pelo envio');
+            }
+
+            capture = await findMessageCapture(groupJid, sentKey.id);
+            if (!capture || capture.source !== 'messages.upsert' || !capture.key) {
+              throw new Error('Mensagem UUID nao entrou no capture-store usado pelo $delete');
+            }
+            targetKey = capture.key;
+            if (targetKey.id !== sentKey.id || targetKey.remoteJid !== groupJid || targetKey.fromMe !== true) {
+              throw new Error('A key capturada diverge da key real retornada pelo Baileys');
+            }
+            const comparedFields = new Set([...Object.keys(sentKey), ...Object.keys(targetKey)]);
+            for (const field of comparedFields) {
+              if (JSON.stringify(targetKey[field]) !== JSON.stringify(sentKey[field])) {
+                throw new Error(`A key capturada diverge no campo ${field}`);
+              }
+            }
+
+            const commandRaw = {
+              key: {
+                id: `LAB_DELETE_COMMAND:${correlationId}`,
+                remoteJid: groupJid,
+                fromMe: false,
+                participant: getMasterUser(),
+              },
+              message: {
+                extendedTextMessage: {
+                  text: '$delete',
+                  contextInfo: {
+                    stanzaId: targetKey.id,
+                    participant: targetKey.participant || adapter.client.userId,
+                    quotedMessage: upsertMessage.message,
+                  },
+                },
+              },
+              messageTimestamp: Math.floor(Date.now() / 1000),
+              isGroup: true,
+            };
+            const commandMessage: any = {
+              id: `whatsapp:LAB_DELETE_COMMAND:${correlationId}`,
+              platform: 'whatsapp',
+              chatId: groupJid,
+              userId: getMasterUser(),
+              userName: 'Lab MASTER',
+              text: '$delete',
+              timestamp: new Date(),
+              isFromMe: false,
+              isCommand: false,
+              raw: commandRaw,
+              hasMedia: false,
+              correlationId,
+              metadata: {
+                deleteE2EObserver: (stage: string, details?: any) => {
+                  commandState = { stage, details };
+                },
+              },
+            };
+
+            const deletePromise = requestConfirmedDelete({
+              platform: 'whatsapp',
+              chatId,
+              targetKey,
+              correlationId,
+              timeoutMs: 10000,
+              sock,
+              sendDelete: async () => {
+                await pm.handleIncomingMessage(commandMessage);
+                return commandState.stage === 'delete-accepted' ? { accepted: true } : null;
+              },
+            });
+            deleteOutcome = await deletePromise;
+            confirmation = deleteOutcome.confirmation || null;
+            confirmationTimedOut = deleteOutcome.finalState === 'TIMEOUT';
+            if (!confirmation) {
+              failureCause = `${deleteOutcome.error || `Sem REVOKE/messages.delete para ${targetKey.id}`}; etapa do comando: ${commandState.stage}`;
+            }
+          } catch (err: any) {
+            failureCause = err?.message || String(err);
+          } finally {
+            markerWaiter.dispose();
+          }
+
+          const deleteRequested = deleteOutcome?.requested === true;
+          const deleteAccepted = deleteOutcome?.accepted === true;
+          const deleteConfirmed = !!confirmation;
+          const passed = deleteConfirmed && deleteAccepted;
+          const finalState = passed ? 'PASS' : confirmationTimedOut ? 'TIMEOUT' : 'FAIL';
+          const keySummary = targetKey ? {
+            remoteJid: targetKey.remoteJid,
+            id: targetKey.id,
+            fromMe: targetKey.fromMe,
+            participant: targetKey.participant ?? null,
+            participantAlt: targetKey.participantAlt ?? null,
+            remoteJidAlt: targetKey.remoteJidAlt ?? null,
+            addressingMode: targetKey.addressingMode ?? null,
+            additionalFields: Object.keys(targetKey).filter((field: string) => ![
+              'id', 'remoteJid', 'fromMe', 'participant', 'participantAlt', 'remoteJidAlt', 'addressingMode',
+            ].includes(field)),
+          } : null;
+          const result = {
+            status: finalState === 'PASS' ? 'DELETE E2E PASS' : finalState === 'TIMEOUT' ? 'DELETE E2E TIMEOUT' : 'DELETE E2E FAIL',
+            finalState,
+            correlationId,
+            marker,
+            groupJid,
+            remoteJid: targetKey?.remoteJid || groupJid,
+            messageCreated,
+            sentMessageId,
+            messageType: capture?.messageType || null,
+            timestamp: capture?.timestamp || null,
+            targetKey: keySummary,
+            quotedKey: targetKey ? {
+              remoteJid: groupJid,
+              stanzaId: targetKey.id,
+              participant: targetKey.participant ?? null,
+            } : null,
+            command: '$delete',
+            commandOrigin: 'loopback harness via PlatformManager.handleIncomingMessage; configured MASTER principal',
+            authorization: isMaster(getMasterUser()) ? 'authorized as configured MASTER' : 'denied',
+            commandStage: commandState.stage,
+            deleteRequested,
+            deleteAccepted,
+            deleteConfirmed,
+            deleteMessageCalled: deleteRequested,
+            revokeConfirmed: confirmation?.protocolMessageType === 'REVOKE',
+            confirmationType: confirmation?.type || null,
+            confirmationSource: confirmation?.confirmationSource || null,
+            protocolMessageType: confirmation?.protocolMessageType || null,
+            envelopeMessageId: confirmation?.envelopeMessageId || null,
+            targetMessageId: targetKey?.id || sentMessageId,
+            confirmationTimestamp: confirmation?.timestamp || null,
+            confirmationTargetKey: confirmation?.targetKey || null,
+            cleanupAttempted: false,
+            cleanupConfirmed: false,
+            pendingMessage: finalState === 'TIMEOUT' && messageCreated && !confirmation,
+            pendingMessageId: finalState === 'TIMEOUT' && !confirmation ? (targetKey?.id || sentMessageId) : null,
+            failureCause: passed ? null : (failureCause || 'Baileys nao confirmou a exclusao real'),
+            loopGuard: 'mensagem alvo fromMe e ignorada pelo normalizer; comando de laboratorio despachado uma vez',
+          };
+          if (passed) totalSuccess++;
+          totalAttempts++;
+          logInfo('[TestServer] /lab/delete-e2e result', result);
+          try {
+            persistDeleteE2EResult(result);
+          } catch (err: any) {
+            logWarning('[TestServer] não foi possível persistir resultado delete-e2e:', err?.message || String(err));
+          }
+          res.writeHead(passed ? 200 : 502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        // ─── Endpoint de delete de mensagem (para laboratório) ───
+        // Usa o JSONL de capturas para obter a WAMessageKey completa (com participantAlt, addressingMode, etc.)
+        // e executa UMA ÚNICA tentativa de delete com a chave completa.
+        // CORREÇÃO 2026-09-14: a chave de delete agora preserva todos os campos: id, remoteJid,
+        // fromMe, participant, participantAlt, addressingMode, e outros campos opcionais presentes
+        // na entrada do JSONL, em vez de reconstruir uma chave truncada.
+        if (req.url === '/lab/delete-message') {
+          const { platform, groupJid, messageId, participant, fromMe } = parsedBody;
+          if (!platform || !groupJid || !messageId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing required fields: platform, groupJid, messageId' }));
+            return;
+          }
+          totalAttempts++;
+          const { adapter } = getAdapterAndSock(platform);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          const baileysAdapter = adapter as any;
+          const sock = baileysAdapter.connection?.getSock?.() || (baileysAdapter as any).sock || null;
+          if (!sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Socket não disponível', platform, groupJid, messageId }));
+            return;
+          }
+
+          // Busca a mensagem no JSONL para obter a chave completa
+          const entries = (await readCaptures()).filter(
+            (c: any) => c.messageId === messageId && (c.groupId === groupJid || c.remoteJid === groupJid)
+          );
+          const targetEntry = entries[0] || null;
+
+          // Constrói o WAMessageKey completo a partir do JSONL (se disponível) ou dos parâmetros
+          const deleteKey: any = {
+            id: messageId,
+            remoteJid: groupJid,
+            fromMe: !!fromMe,
+          };
+          if (targetEntry) {
+            // Usa os campos completos do JSONL
+            deleteKey.participant = targetEntry.participant || participant || '';
+            deleteKey.participantAlt = targetEntry.rawPayloadSafe?.key?.participantAlt;
+            deleteKey.addressingMode = targetEntry.rawPayloadSafe?.key?.addressingMode;
+            deleteKey.server_id = targetEntry.rawPayloadSafe?.key?.server_id;
+            // Campos additional do WAMessageKey
+            if (targetEntry.rawPayloadSafe?.key?.remoteJidAlt) deleteKey.remoteJidAlt = targetEntry.rawPayloadSafe.key.remoteJidAlt;
+            if (targetEntry.rawPayloadSafe?.key?.participantUsername) deleteKey.participantUsername = targetEntry.rawPayloadSafe.key.participantUsername;
+          } else if (participant) {
+            deleteKey.participant = participant;
+          }
+
+          logInfo('[TestServer] /lab/delete-message: construída WAMessageKey completa para envio', {
+            messageId, groupJid, deleteKey,
+          });
+
+          // Validações de proteção
+          const isFromBot = !!(deleteKey.fromMe);
+          if (isFromBot) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              attempted: true,
+              requestSent: false,
+              messageKey: deleteKey,
+              confirmation: 'blocked',
+              reason: 'Proteção: não deletar mensagem do próprio bot (fromMe=true)',
+            }));
+            return;
+          }
+
+          // Confirmação de que está no grupo correto
+          if (deleteKey.remoteJid !== groupJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              attempted: true,
+              requestSent: false,
+              messageKey: deleteKey,
+              confirmation: 'blocked',
+              reason: `remoteJid (${deleteKey.remoteJid}) não corresponde ao groupJid (${groupJid})`,
+            }));
+            return;
+          }
+
+          try {
+            // Evento de confirmação: ouvir messages.update logo antes do delete
+            let confirmationEvent: any = null;
+            let sendResult: any = null;
+            if (sock.ev) {
+              const unload = () => {
+                try { sock.ev.off('messages.update', updateListener); } catch {}
+                try { sock.ev.off('messages.delete', deleteListener); } catch {}
+              };
+              const updateListener = (data: any) => {
+                if (Array.isArray(data) && data.length > 0) {
+                  for (const update of data) {
+                    if (update?.key?.id === messageId) {
+                      confirmationEvent = { type: 'messages.update', data: update };
+                      logInfo('[TestServer] MESSAGES_UPDATE_EVENT', { messageId, update: update });
+                    }
+                  }
+                }
+              };
+              const deleteListener = (data: any) => {
+                if (data?.keys?.some((k: any) => k?.id === messageId)) {
+                  confirmationEvent = { type: 'messages.delete', data };
+                  logInfo('[TestServer] MESSAGES_DELETE_EVENT', { messageId, keys: data.keys });
+                }
+              };
+              sock.ev.on('messages.update', updateListener);
+              sock.ev.on('messages.delete', deleteListener);
+              
+              // Aguarda evento por até 8s após o delete
+              const waitForConfirmation = new Promise<any>((resolve) => {
+                const timeout = setTimeout(() => resolve(null), 8000);
+                const check = setInterval(() => {
+                  if (confirmationEvent) {
+                    clearTimeout(timeout);
+                    clearInterval(check);
+                    resolve(confirmationEvent);
+                  }
+                }, 100);
+              });
+
+              const deletePromise = baileysAdapter.sendMessage(groupJid, '', { delete: deleteKey });
+              const [sr, evt] = await Promise.all([deletePromise, waitForConfirmation]);
+              sendResult = sr;
+              unload();
+              confirmationEvent = evt;
+            } else {
+              sendResult = await baileysAdapter.sendMessage(groupJid, '', { delete: deleteKey });
+              confirmationEvent = null;
+            }
+
+            totalSuccess++;
+            logInfo('[TestServer] /lab/delete-message: delete enviado — registrando resultado', {
+              messageId, groupJid,
+              deleteKey,
+              sendResult: sendResult ? {
+                key: sendResult.key,
+                protocolMessage: sendResult.message?.protocolMessage || null,
+                status: sendResult.status,
+              } : null,
+              confirmationEvent,
+              conclusion: confirmationEvent ? 'confirmed' : 'not_confirmed',
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              attempted: true, 
+              requestSent: true, 
+              messageKey: deleteKey,
+              confirmation: confirmationEvent ? 'confirmed' : 'not_confirmed',
+              reason: confirmationEvent 
+                ? `Evento ${confirmationEvent.type} recebido para ${messageId}`
+                : 'sendMessage retornou sem erro, mas nenhum evento de confirmação (messages.update/messages.delete) foi recebido no período de espera. Isso NÃO confirma que a mensagem foi apagada visualmente.',
+              sendMessageResult: sendResult ? {
+                key: sendResult.key,
+                protocolMessage: sendResult.message?.protocolMessage || null,
+                status: sendResult.status,
+              } : null,
+              confirmationEvent: confirmationEvent || null,
+            }));
+          } catch (err: any) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ 
+              attempted: true, 
+              requestSent: false, 
+              messageKey: deleteKey,
+              confirmation: 'error',
+              reason: err?.message || String(err),
+            }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de status do adapter (para laboratório) ───
+        if (req.url === '/lab/adapter') {
+          const { platform } = parsedBody;
+          if (!platform) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock(platform);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            platform,
+            adapterId: adapter?.platform,
+            connected: !!sock?.user,
+            userId: sock?.user?.id || null,
+            storeAvailable: !!sock?.store,
+          }));
+          return;
+        }
+
+        // ─── Endpoint de teste do AntiBot (caminho REAL de produção) ───────
+        // Constrói uma WAMessage sintética e chama o MESMO evaluate() usado em
+        // produção, com o ctx REAL (socket/sendMessage/removeParticipant reais).
+        // Usado para provar detecção + ação sem depender de um bot externo.
+        if (req.url === '/lab/antibot-test') {
+          const { platform, groupJid, participant, messageType, text, pushName } = parsedBody;
+          if (!platform || !groupJid || !participant) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform, groupJid or participant' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock(platform);
+          if (!adapter || !sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket indisponível' }));
+            return;
+          }
+          try {
+            // Resolve o participante no metadata para obter LID/PN reais
+            let partId = participant;
+            let partAlt: string | undefined;
+            try {
+              const chat = await adapter.client.getChat(groupJid);
+              const hit = ((chat as any)?.participants || []).find((p: any) => {
+                const pn = String(p?.phoneNumber || '').replace(/\D/g, '');
+                const id = String(p?.id || '').replace(/\D/g, '');
+                const want = String(participant).replace(/\D/g, '');
+                return pn === want || id === want;
+              });
+              if (hit) { partId = hit.id; partAlt = hit.phoneNumber; }
+            } catch { /* usa o valor recebido */ }
+
+            const extraText = (parsedBody.extraText as string | undefined) || '';
+            const footer = parsedBody.footer as string | undefined;
+            const msgObj = buildAntiBotTestMessage(messageType, text, extraText, footer);
+
+            const waMessage: any = {
+              key: { id: `ANTIBOT-${Date.now()}`, remoteJid: groupJid, fromMe: false,
+                     participant: partId, participantAlt: partAlt, addressingMode: 'lid' },
+              message: msgObj,
+              messageTimestamp: Math.floor(Date.now() / 1000),
+            };
+
+            // INC-008: simula entrada recente — o combo consome no evaluate
+            // (mesma chave groupJid+partId que o memberJoinService marca).
+            if (parsedBody.firstMessage === true) {
+              markRecentJoin(groupJid, partId);
+              logInfo('[TestServer] /lab/antibot-test firstMessage — join marcado', { groupJid, partId });
+            }
+
+            const { evaluate } = await import('../services/autoModEngine.js');
+            const result = await evaluate(
+              waMessage,
+              {
+                sock, userId: (adapter as any).userId, fromMe: false, groupName: groupJid,
+                getChat: async (jid: string) => {
+                  const c = await adapter.client.getChat(jid);
+                  return { participants: (c as any)?.participants || [], id: jid, subject: (c as any)?.name };
+                },
+                sendMessage: async (jid: string, t2: string, opts?: any) => {
+                  try { return await adapter.client.sendMessage(jid, t2, opts); } catch { return null; }
+                },
+                removeParticipant: async (g: string, u: string) => {
+                  try { await adapter.client.removeParticipant(g, u); } catch { /* ignorar */ }
+                },
+                log: logInfo, warn: logWarning, error: logError,
+              },
+              groupJid,
+              partId,
+              pushName || '',
+            );
+
+            logInfo('[TestServer] /lab/antibot-test', { messageType: messageType || 'buttonsMessage', partId, partAlt, result });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, messageType: messageType || 'buttonsMessage', participant: partId,
+              participantAlt: partAlt, key: waMessage.key, result }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de restauração de membro (para testes controlados) ───
+        // Reingressa um membro removido pelo $kick/$ban usando o socket real.
+        // Usado APÓS testes destrutivos autorizados, para restaurar o alvo.
+        if (req.url === '/lab/restore-member') {
+          const { platform, groupJid, participant } = parsedBody;
+          if (!platform || !groupJid || !participant) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform, groupJid or participant' }));
+            return;
+          }
+          const { sock } = getAdapterAndSock(platform);
+          if (!sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Socket não disponível' }));
+            return;
+          }
+          try {
+            // $ban faz updateBlockStatus('block') — sem desbloquear, o reingresso
+            // retorna 403. Desbloqueia antes de tentar adicionar.
+            const pnJid = participant.includes('@') ? participant : `${participant}@s.whatsapp.net`;
+            try {
+              await sock.updateBlockStatus(pnJid, 'unblock');
+              logInfo('[TestServer] /lab/restore-member: unblock aplicado', { pnJid });
+            } catch (e: any) {
+              logWarning('[TestServer] /lab/restore-member: unblock falhou (não crítico)', e?.message);
+            }
+            const result = await sock.groupParticipantsUpdate(groupJid, [participant], 'add');
+            logInfo('[TestServer] /lab/restore-member', { groupJid, participant, result });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, groupJid, participant, result }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── /lab/group-info: participantes + admins (E2E do welcome, TESTE 2) ───
+        // Probe de socket vivo (regra do repo: probe que precisa do socket é
+        // rota /lab, nunca script standalone). Expõe o metadata do grupo — o
+        // mesmo getChat que o resolvePn usa para o mapeamento LID→PN — com o
+        // status de admin de cada participante e do próprio bot.
+        if (req.url === '/lab/group-info') {
+          const { groupJid } = parsedBody;
+          if (!groupJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing groupJid' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock || !(adapter as any).client?.isReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket WhatsApp indisponível' }));
+            return;
+          }
+          try {
+            const chat: any = await (adapter as any).getChat(groupJid);
+            if (!chat) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `Grupo não encontrado: ${groupJid}` }));
+              return;
+            }
+            const digitsOf = (v: unknown) => String(v ?? '').replace(/\D/g, '');
+            const botPnDigits = digitsOf(String(sock.user?.id || '').split(':')[0]);
+            const botLid = process.env.BOT_LID || '2592935567439@lid';
+            const botLidDigits = digitsOf(botLid.split(':')[0]);
+            const isBotJid = (jid: unknown) => {
+              const d = digitsOf(String(jid ?? '').split(':')[0]);
+              return !!d && (d === botPnDigits || d === botLidDigits);
+            };
+            const participants = ((chat as any).participants || []).map((p: any) => ({
+              id: p?.id || '',
+              phoneNumber: p?.phoneNumber ?? undefined,
+              // O chatManager entrega isAdmin/isSuperAdmin (booleans); o campo
+              // `admin` do metadata cru não sobrevive ao mapping — ler o
+              // mapeado, senão todo grupo lê como "sem admin nenhum".
+              admin: p?.admin ?? (p?.isSuperAdmin ? 'superadmin' : p?.isAdmin ? 'admin' : null),
+              isBot: isBotJid(p?.id),
+            }));
+            const botEntry = participants.find((p: any) => p.isBot);
+            logInfo('[TestServer] /lab/group-info', {
+              groupJid, count: participants.length, botIsAdmin: !!botEntry?.admin,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true, groupJid,
+              name: chat.name ?? chat.subject ?? '',
+              botIsAdmin: !!botEntry?.admin,
+              participants,
+            }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── /lab/remove-and-add: ciclo remove→5s→re-add (E2E do welcome real) ───
+        // Remove um participante NÃO protegido e re-adiciona 5s depois para
+        // disparar o memberJoinService (welcome com mention). Proteções: MASTER,
+        // o próprio bot e admins do grupo nunca são alvo. O bot precisa ser admin.
+        if (req.url === '/lab/remove-and-add') {
+          const { groupJid, userJid } = parsedBody;
+          if (!groupJid || !userJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing groupJid or userJid' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock || !(adapter as any).client?.isReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket WhatsApp indisponível' }));
+            return;
+          }
+          try {
+            const chat: any = await (adapter as any).getChat(groupJid);
+            if (!chat) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `Grupo não encontrado: ${groupJid}` }));
+              return;
+            }
+            const parts: any[] = (chat as any).participants || [];
+            const digitsOf = (v: unknown) => String(v ?? '').replace(/\D/g, '');
+            const targetDigits = digitsOf(String(userJid).split(':')[0]);
+            const sameJid = (a: unknown) =>
+              !!targetDigits && digitsOf(String(a ?? '').split(':')[0]) === targetDigits;
+
+            // O bot precisa ser admin para remover/re-adicionar
+            const botPnDigits = digitsOf(String(sock.user?.id || '').split(':')[0]);
+            const botLid = process.env.BOT_LID || '2592935567439@lid';
+            const botLidDigits = digitsOf(botLid.split(':')[0]);
+            const botPart = parts.find((p: any) =>
+              [String(p?.id ?? '').split(':')[0]].map(digitsOf).some((d) => d === botPnDigits || d === botLidDigits));
+            // isAdmin/isSuperAdmin é o que o chatManager entrega (booleans)
+            if (!(botPart?.isAdmin || botPart?.isSuperAdmin)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'bot não é admin neste grupo', botParticipant: botPart ?? null }));
+              return;
+            }
+
+            // Alvos protegidos: MASTER, o próprio bot, admin do grupo
+            const target = parts.find((p: any) =>
+              sameJid(p?.id) || (!!p?.phoneNumber && digitsOf(p.phoneNumber) === targetDigits));
+            const masterDigits = digitsOf(process.env.MASTER_USER || '558898314322');
+            if (targetDigits === masterDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o MASTER — protegido' }));
+              return;
+            }
+            if (targetDigits === botPnDigits || targetDigits === botLidDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o próprio bot — protegido' }));
+              return;
+            }
+            if (target?.isAdmin || target?.isSuperAdmin) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é admin do grupo — protegido', target }));
+              return;
+            }
+            if (!target) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo não é participante do grupo', userJid }));
+              return;
+            }
+
+            logInfo('[TestServer] /lab/remove-and-add: remove', { groupJid, userJid });
+            const removedAt = Date.now();
+            const removeResult = await sock.groupParticipantsUpdate(groupJid, [userJid], 'remove');
+            logInfo('[TestServer] /lab/remove-and-add: removed', { removeResult });
+            // O WhatsApp precisa processar a saída antes do re-ingresso
+            await new Promise((r) => setTimeout(r, 5000));
+            // ADD aceita PN, não LID (provado 23/10: add com @lid → bad-request;
+            // restore-member com PN → 200 + welcome). Quando o metadata traz o
+            // phoneNumber do alvo, adiciona pelo PN.
+            const addJid = target?.phoneNumber ? String(target.phoneNumber) : userJid;
+            logInfo('[TestServer] /lab/remove-and-add: add (welcome deve disparar)', { groupJid, userJid: addJid });
+            const addedAt = Date.now();
+            const addResult = await sock.groupParticipantsUpdate(groupJid, [addJid], 'add');
+            logInfo('[TestServer] /lab/remove-and-add: added', { addResult });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true, steps: ['removed', 'waited', 'added'],
+              timestamps: { removedAt, addedAt },
+              removeResult, addResult,
+            }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── /lab/remove-member: REMOVE solto (E2E feedback com pessoa real) ───
+        // Igual ao remove do remove-and-add, SEM o re-add: o fluxo real de
+        // feedback exige remover, deixar o worker mandar o PV, esperar a
+        // resposta do removido e só depois devolvê-lo (restore-member).
+        // Proteções idênticas: MASTER, o próprio bot, admins do grupo.
+        if (req.url === '/lab/remove-member') {
+          const { groupJid, userJid } = parsedBody;
+          if (!groupJid || !userJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing groupJid or userJid' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock || !(adapter as any).client?.isReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket WhatsApp indisponível' }));
+            return;
+          }
+          try {
+            const chat: any = await (adapter as any).getChat(groupJid);
+            if (!chat) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `Grupo não encontrado: ${groupJid}` }));
+              return;
+            }
+            const parts: any[] = (chat as any).participants || [];
+            const digitsOf = (v: unknown) => String(v ?? '').replace(/\D/g, '');
+            const targetDigits = digitsOf(String(userJid).split(':')[0]);
+            const sameJid = (a: unknown) =>
+              !!targetDigits && digitsOf(String(a ?? '').split(':')[0]) === targetDigits;
+
+            const botPnDigits = digitsOf(String(sock.user?.id || '').split(':')[0]);
+            const botLid = process.env.BOT_LID || '2592935567439@lid';
+            const botLidDigits = digitsOf(botLid.split(':')[0]);
+            const botPart = parts.find((p: any) =>
+              [String(p?.id ?? '').split(':')[0]].map(digitsOf).some((d) => d === botPnDigits || d === botLidDigits));
+            if (!(botPart?.isAdmin || botPart?.isSuperAdmin)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'bot não é admin neste grupo', botParticipant: botPart ?? null }));
+              return;
+            }
+
+            const target = parts.find((p: any) =>
+              sameJid(p?.id) || (!!p?.phoneNumber && digitsOf(p.phoneNumber) === targetDigits));
+            const masterDigits = digitsOf(process.env.MASTER_USER || '558898314322');
+            if (targetDigits === masterDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o MASTER — protegido' }));
+              return;
+            }
+            if (targetDigits === botPnDigits || targetDigits === botLidDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o próprio bot — protegido' }));
+              return;
+            }
+            if (target?.isAdmin || target?.isSuperAdmin) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é admin do grupo — protegido', target }));
+              return;
+            }
+            if (!target) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo não é participante do grupo', userJid }));
+              return;
+            }
+
+            logInfo('[TestServer] /lab/remove-member: remove', { groupJid, userJid });
+            const removedAt = Date.now();
+            const removeResult = await sock.groupParticipantsUpdate(groupJid, [userJid], 'remove');
+            logInfo('[TestServer] /lab/remove-member: removed', { removeResult });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true, steps: ['removed'],
+              timestamps: { removedAt },
+              removeResult,
+            }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── /lab/promote-member: PROMOVE a admin (E2E do $promover fix) ───
+        // Contrato do comando (a47fe6a): adapter.promoteParticipant(chatId,
+        // userId). Valida o caminho REAL: BaileysAdapter → BaileysMemberManager
+        // → groupParticipantsUpdate 'promote' (status != 200 → erro).
+        // Proteções idênticas ao remove-member: MASTER, o próprio bot e
+        // admins do grupo não podem ser alvo. PN do participant quando
+        // mapeado (lição INC-018: ações de grupo com LID podem dar
+        // bad-request — remove aceita LID, add exige PN; promote usa PN
+        // por garantia, com fallback para o JID cru).
+        if (req.url === '/lab/promote-member') {
+          const { groupJid, userJid } = parsedBody;
+          if (!groupJid || !userJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing groupJid or userJid' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock || !(adapter as any).client?.isReady) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket WhatsApp indisponível' }));
+            return;
+          }
+          try {
+            const chat: any = await (adapter as any).getChat(groupJid);
+            if (!chat) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `Grupo não encontrado: ${groupJid}` }));
+              return;
+            }
+            const parts: any[] = (chat as any).participants || [];
+            const digitsOf = (v: unknown) => String(v ?? '').replace(/\D/g, '');
+            const targetDigits = digitsOf(String(userJid).split(':')[0]);
+            const sameJid = (a: unknown) =>
+              !!targetDigits && digitsOf(String(a ?? '').split(':')[0]) === targetDigits;
+
+            const botPnDigits = digitsOf(String(sock.user?.id || '').split(':')[0]);
+            const botLid = process.env.BOT_LID || '2592935567439@lid';
+            const botLidDigits = digitsOf(botLid.split(':')[0]);
+            const botPart = parts.find((p: any) =>
+              [String(p?.id ?? '').split(':')[0]].map(digitsOf).some((d) => d === botPnDigits || d === botLidDigits));
+            if (!(botPart?.isAdmin || botPart?.isSuperAdmin)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'bot não é admin neste grupo', botParticipant: botPart ?? null }));
+              return;
+            }
+
+            const target = parts.find((p: any) =>
+              sameJid(p?.id) || (!!p?.phoneNumber && digitsOf(p.phoneNumber) === targetDigits));
+            const masterDigits = digitsOf(process.env.MASTER_USER || '558898314322');
+            if (targetDigits === masterDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o MASTER — protegido' }));
+              return;
+            }
+            if (targetDigits === botPnDigits || targetDigits === botLidDigits) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo é o próprio bot — protegido' }));
+              return;
+            }
+            if (target?.isAdmin || target?.isSuperAdmin) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo já é admin do grupo', target }));
+              return;
+            }
+            if (!target) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'alvo não é participante do grupo', userJid }));
+              return;
+            }
+
+            // PN mapeado quando existir; senão o JID cru (LID aceito pelo promote).
+            const pn = target?.phoneNumber
+              ? `${digitsOf(target.phoneNumber)}@s.whatsapp.net`
+              : userJid;
+            logInfo('[TestServer] /lab/promote-member: promote', { groupJid, pn });
+            const promoteResult = await (adapter as any).promoteParticipant(groupJid, pn);
+            logInfo('[TestServer] /lab/promote-member: promoted', { promoteResult });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true, steps: ['promoted'],
+              timestamps: { promotedAt: Date.now() },
+              target: { id: target?.id, phoneNumber: target?.phoneNumber ?? null },
+              promoteResult,
+            }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── /lab/run-feedback-worker: dispara UM ciclo do worker AGORA ────
+        // E2E do feedback: sem esperar o interval de 6h. Usa o MESMO send
+        // registrado pelo startFeedbackWorker (PV WhatsApp + espelho
+        // TELEGRAM_FEEDBACK_CHAT_ID). A janela de agrupamento (10min) continua
+        // valendo: eventos recentes ficam 'young' e não são enviados.
+        if (req.url === '/lab/run-feedback-worker') {
+          try {
+            const { runFeedbackWorker, getRegisteredFeedbackSend, registerFeedbackSend } = await import('./feedbackWorker.js');
+            const send = getRegisteredFeedbackSend();
+            if (!send) {
+              res.writeHead(503, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'worker de feedback não registrado (bot não iniciou?)' }));
+              return;
+            }
+            // INC-024 ITEM 4: body {dry:true} troca TEMPORARIAMENTE o send de
+            // TODAS as plataformas por um dry (só loga, nunca envia PV real)
+            // e restaura o registry original no finally. Prova em runtime que
+            // o worker resolve o send POR EVENTO/plataforma.
+            if (parsedBody?.dry === true) {
+              const dryFn = async (target: string) => {
+                logInfo('[TestServer] feedback DRY send', { target });
+                return true;
+              };
+              const saved: Array<[string, unknown]> = [];
+              for (const p of ['whatsapp', 'telegram', 'discord']) {
+                const orig = getRegisteredFeedbackSend(p);
+                if (orig) saved.push([p, orig]);
+                registerFeedbackSend(p, dryFn);
+              }
+              let dryStats;
+              try {
+                dryStats = await runFeedbackWorker(dryFn);
+              } finally {
+                for (const [p, fn] of saved) registerFeedbackSend(p, fn as any);
+              }
+              logInfo('[TestServer] /lab/run-feedback-worker', { dry: true, stats: dryStats });
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, dry: true, stats: dryStats }, null, 1));
+              return;
+            }
+            const stats = await runFeedbackWorker(send);
+            logInfo('[TestServer] /lab/run-feedback-worker', { stats });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, stats }, null, 1));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de histórico via fetchMessageHistory ──────────────────
+        if (req.url === '/lab/history') {
+          const { platform, groupJid, oldestMsgId, oldestMsgTimestamp, count } = parsedBody;
+          if (!platform || !groupJid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform or groupJid' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock(platform);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          if (!sock?.fetchMessageHistory) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'fetchMessageHistory não disponível neste socket' }));
+            return;
+          }
+          try {
+            const oldestKey = {
+              id: oldestMsgId || '__MOST_RECENT__',
+              remoteJid: groupJid,
+              fromMe: false,
+              participant: oldestMsgId ? '' : (sock?.user?.id || ''),
+            };
+            const historyResponse = await sock.fetchMessageHistory(
+              count || 200,
+              oldestKey,
+              oldestMsgTimestamp || Date.now()
+            );
+            // O servidor retorna um XML/String — tente parsear
+            let messages: any[] = [];
+            try {
+              // Pode vir como JSON string ou XML — tentamos ambos
+              if (typeof historyResponse === 'string') {
+                try {
+                  messages = JSON.parse(historyResponse);
+                } catch {
+                  // Se não for JSON, retornamos o raw para diagnóstico
+                  messages = [{ _raw: historyResponse }];
+                }
+              } else {
+                messages = [historyResponse];
+              }
+            } catch {
+              messages = [{ _raw: String(historyResponse) }];
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, messages, count: messages.length, groupJid }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de teste do fluxo $menu completo ───
+        if (req.url === '/lab/test-menu-flow') {
+          const platform = parsedBody.platform || 'whatsapp';
+          const chatId = parsedBody.chatId || '';
+          const adapter = pm.getAdapter(platform as any);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+
+          // Enable lab mode for this test (save previous value for restore)
+          const prevLabMode = process.env.WPP_LAB_MODE;
+          process.env.WPP_LAB_MODE = '1';
+
+          try {
+            logInfo(`[TestServer] /lab/test-menu-flow: Enviando $menu para ${chatId}`);
+            const result = await pm.sendMessageAndProcess(platform, chatId, '$menu', true);
+            logInfo('[TestServer] /lab/test-menu-flow: Fluxo concluído', { result });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, platform, chatId, result }));
+          } catch (err: any) {
+            logError('TestServer.test-menu-flow', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          } finally {
+            // Restore previous lab mode value
+            if (prevLabMode === undefined) {
+              delete process.env.WPP_LAB_MODE;
+            } else {
+              process.env.WPP_LAB_MODE = prevLabMode;
+            }
+          }
+          return;
+        }
+
+        // ─── Endpoint E2E real (laboratório) — valida quote/reação —──
+        if (req.url === '/lab/e2e/test-quote-flow') {
+          const platform = parsedBody.platform || 'whatsapp';
+          const chatId = parsedBody.chatId || '120363410094452673@g.us';
+          const originalMsgId = parsedBody.originalMsgId || 'test-msg-id';
+
+          // Captura eventos de resposta via arquivo
+          const capturesFile = path.join(process.cwd(), 'laboratorio', 'e2e-capture.jsonl');
+          try { fs.mkdirSync(path.dirname(capturesFile), { recursive: true }); } catch {}
+
+          // Configura captura persistente do adapter Baileys para eventos upsert
+          const adapterForCapture = pm.getAdapter(platform as any);
+          const adapterForCaptureAny = adapterForCapture as any;
+          const sockForCapture = adapterForCapture ? (adapterForCaptureAny.connection?.getSock?.() || adapterForCaptureAny.sock || null) : null;
+          if (sockForCapture && sockForCapture.ev) {
+            // Listener único (não duplicar se já existia) — apenas adiciona se ainda não está registrado
+            // Não removemos o listener anterior para evitar conflitos; adicionamos outro se necessário
+            sockForCapture.ev.on('messages.upsert', (event: any) => {
+              try {
+                for (const msg of (event.messages || [])) {
+                  const captureObj: any = {
+                    type: 'messages.upsert',
+                    timestamp: Date.now(),
+                    msgKey: msg?.key ? {
+                      id: msg?.key?.id,
+                      remoteJid: msg?.key?.remoteJid,
+                      fromMe: msg?.key?.fromMe,
+                      participant: msg?.key?.participant,
+                      participantAlt: msg?.key?.participantAlt,
+                      addressingMode: msg?.key?.addressingMode,
+                    } : null,
+                    messageType: msg?.message ? Object.keys(msg?.message || {})[0] || 'empty' : 'none',
+                    messageContent: msg?.message ? 'present' : 'empty',
+                    // Preserva contexto se existir
+                    contextInfo: msg?.message?.extendedTextMessage?.contextInfo ? {
+                      stanzaId: msg?.message?.extendedTextMessage?.contextInfo?.stanzaId,
+                      quotedMessage: msg?.message?.extendedTextMessage?.contextInfo?.quotedMessage ? 'present' : 'none',
+                      participant: msg?.message?.extendedTextMessage?.contextInfo?.participant,
+                    } : null,
+                  };
+                  const capturesFile = path.join(process.cwd(), 'laboratorio', 'e2e-capture.jsonl');
+                  try {
+                    fs.mkdirSync(path.dirname(capturesFile), { recursive: true });
+                    fs.appendFileSync(capturesFile, JSON.stringify(captureObj) + '\n');
+                  } catch {}
+                }
+              } catch {}
+            });
+          }
+
+          // Use withLabMode para garantir restauração do LAB_MODE mesmo em caso de erro
+          const result = await withLabMode(async () => {
+            return await pm.sendMessageAndProcess(platform, chatId, '$menu', true);
+          });
+
+          // Aguarda brevemente e lê capturas
+          await new Promise(r => setTimeout(r, 2000));
+          const captures: any[] = [];
+          try {
+            if (fs.existsSync(capturesFile)) {
+              const lines = fs.readFileSync(capturesFile, 'utf8').trim().split('\n').filter(Boolean);
+              for (const line of lines.slice(-20)) {
+                try { captures.push(JSON.parse(line)); } catch {}
+              }
+            }
+          } catch {}
+
+          // Inspeciona mensagens capturadas para quote (stanzaId) e reaction
+          let quotePass = false;
+          let quoteStanzaId: string | undefined = undefined;
+          let reactionPass = false;
+
+          for (const cap of captures) {
+            if (cap.type === 'messages.upsert') {
+              const msg = cap.msg || cap;
+              const cinfo = msg?.message?.extendedTextMessage?.contextInfo || msg?.message?.imageMessage?.contextInfo || {};
+              const stanzaId = cinfo.stanzaId || msg?.contextInfo?.stanzaId;
+              if (stanzaId && msg?.key?.fromMe === true) {
+                quoteStanzaId = stanzaId;
+                quotePass = stanzaId === originalMsgId;
+              }
+            }
+            if (cap.type === 'reactionMessage' || (cap.msgType && String(cap.msgType).includes('reaction')) || (cap.msg && cap.msg === 'reactionMessage')) {
+              reactionPass = true;
+            }
+          }
+
+          // Se ainda não tem captures, retorna resultado do fluxo mas marca FAIL estrutural
+          const structured = {
+            ok: result?.success !== false,
+            platform,
+            chatId,
+            result,
+            labModeEnabled: process.env.WPP_LAB_MODE === '1',
+            e2e: {
+              originalMsgId,
+              quote: {
+                status: quotePass ? 'PASS_QUOTE' : (quoteStanzaId ? 'FAIL_QUOTE_STANZA_MISMATCH' : 'FAIL_QUOTE_NOT_PRESENT'),
+                expectedStanzaId: originalMsgId,
+                receivedStanzaId: quoteStanzaId || undefined,
+                capturesInspected: captures.length,
+                note: quotePass ? 'Quote confirmado estruturalmente (stanzaId corresponde)' : 'Quote NÃO confirmado — resposta não contém referência estrutural à mensagem original',
+              },
+              reaction: {
+                status: reactionPass ? 'PASS_REACTION' : 'FAIL_REACTION_NOT_DETECTED',
+                note: reactionPass ? 'Reação confirmada no evento messages.upsert' : 'Nenhum evento de reação capturado',
+              },
+            },
+          };
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify(structured, null, 2));
+                    return;
+                  }
+
+                  // ─── Endpoint TESTE 1 ISOLADO — quote direto com WAMessage REAL (sock.sendMessage) ───
+        if (req.url === '/lab/test1/isolated-quote') {
+          const platform = parsedBody.platform || 'whatsapp';
+          const chatId = parsedBody.chatId || '120363410094452673@g.us';
+          const adapter = pm.getAdapter(platform as any);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          const adapterAny = adapter as any;
+          const sock = adapterAny.connection?.getSock?.() || adapterAny.sock || null;
+          if (!sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Socket não disponível' }));
+            return;
+          }
+
+          // Use withLabMode para garantir restauração do LAB_MODE mesmo em caso de erro
+          const result = await withLabMode(async () => {
+            return await pm.sendMessageAndProcess(platform, chatId, '$menu', true);
+          });
+
+                    // Registrar listener para capturar messages.upsert para este teste
+                    const capturesFile = path.join(process.cwd(), 'laboratorio', 'test1-capture.jsonl');
+                    try { fs.mkdirSync(path.dirname(capturesFile), { recursive: true }); } catch {}
+                    let quotePass = false;
+                    let quoteStanzaId: string | undefined = undefined;
+                    const sockForCapture = sock;
+                    if (sockForCapture && sockForCapture.ev) {
+                      sockForCapture.ev.on('messages.upsert', (event: any) => {
+                        try {
+                          for (const msg of (event.messages || [])) {
+                            const cinfo = msg?.message?.extendedTextMessage?.contextInfo || msg?.message?.imageMessage?.contextInfo || {};
+                            const stanzaId = cinfo.stanzaId;
+                            if (stanzaId && msg?.key?.fromMe === true) {
+                              // Escreve no JSONL para auditoria
+                              const captureObj = {
+                                type: 'messages.upsert',
+                                timestamp: Date.now(),
+                                msgKey: msg.key,
+                                contextInfo: {
+                                  stanzaId: cinfo.stanzaId || null,
+                                  quotedMessage: cinfo.quotedMessage ? 'present' : 'none',
+                                  participant: cinfo.participant || null,
+                                },
+                              };
+                              try { fs.appendFileSync(capturesFile, JSON.stringify(captureObj) + '\n'); } catch {}
+                              // Verifica se é o quote que estamos procurando
+                              if (sentB && cinfo.stanzaId === sentB.key?.id) {
+                                quotePass = true;
+                                quoteStanzaId = cinfo.stanzaId;
+                              }
+                            }
+                          }
+                        } catch {}
+                      });
+                    }
+
+                    // --- TESTE 1A: SEM QUOTE (controle) ---
+          const markerA = `LAB_NO_QUOTE_${Date.now()}`;
+          let sentA = null;
+          let sentA_error = null;
+          try {
+            sentA = await sock.sendMessage(chatId, { text: markerA });
+          } catch (e: any) {
+            sentA_error = e?.message || String(e);
+          }
+          await new Promise(r => setTimeout(r, 2000));
+
+          // --- TESTE 1B: COM QUOTE USANDO WAMessage REAL ---
+          const markerB = `LAB_QUOTE_ORIGINAL_${Date.now()}`;
+          let sentB: any = null;
+          let replyB = null;
+          let sentB_error = null;
+          let replyB_error = null;
+          try {
+            sentB = await sock.sendMessage(chatId, { text: markerB });
+            // TESTE 1C: Captura direta do WAMessage original em JSONL (sem depender de logInfo)
+            const laboratorioDir = path.join(process.cwd(), 'laboratorio');
+            if (!fs.existsSync(laboratorioDir)) {
+              fs.mkdirSync(laboratorioDir, { recursive: true });
+            }
+            const captureFile = path.join(laboratorioDir, 'test1-capture.jsonl');
+            // Limpa arquivo antigo para esta execução
+            if (fs.existsSync(captureFile)) {
+              fs.writeFileSync(captureFile, '');
+            }
+            // Registra o WAMessage original COMPLETO
+            const sentBCapture: any = {
+              timestamp: Date.now(),
+              event: 'TESTE_1C_ORIGINAL_WAMESSAGE',
+              source: 'sock.sendMessage(chatId, { text: markerB })',
+              sentB: {
+                key: sentB?.key ? {
+                  id: sentB.key.id,
+                  remoteJid: sentB.key.remoteJid,
+                  fromMe: sentB.key.fromMe,
+                  participant: sentB.key.participant || undefined,
+                  participantAlt: sentB.key.participantAlt || undefined,
+                  addressingMode: sentB.key.addressingMode || undefined,
+                  ...(sentB.key.participantUsername !== undefined && { participantUsername: sentB.key.participantUsername }),
+                } : null,
+                message: sentB?.message ? {
+                  keys: Object.keys(sentB.message),
+                  raw: sentB.message,
+                } : null,
+                messageTimestamp: sentB?.messageTimestamp,
+                participant: sentB?.participant,
+                status: sentB?.status,
+              },
+              // Estrutura de contextInfo dentro do message de sentB
+              sentB_message_contextInfo: sentB?.message ? findContextInfoInMessage(sentB.message) : null,
+            };
+            fs.appendFileSync(captureFile, JSON.stringify(sentBCapture) + '\n');
+
+            await new Promise(r => setTimeout(r, 2000));
+            replyB = await sock.sendMessage(chatId, { text: 'LAB_QUOTE_RESPONSE' }, { quoted: sentB });
+            // TESTE 1D: Captura direta da resposta COMPLETA + inspeção recursiva em JSONL
+            const replyBCapture: any = {
+              timestamp: Date.now(),
+              event: 'TESTE_1D_REPLY_WAMESSAGE',
+              source: 'sock.sendMessage(chatId, { text: LAB_QUOTE_RESPONSE }, { quoted: sentB })',
+              sentB_key_id: sentB?.key?.id,
+              replyB: {
+                key: replyB?.key ? {
+                  id: replyB.key.id,
+                  remoteJid: replyB.key.remoteJid,
+                  fromMe: replyB.key.fromMe,
+                  participant: replyB.key.participant || undefined,
+                  participantAlt: replyB.key.participantAlt || undefined,
+                  addressingMode: replyB.key.addressingMode || undefined,
+                  ...(replyB.key.participantUsername !== undefined && { participantUsername: replyB.key.participantUsername }),
+                } : null,
+                message: replyB?.message ? {
+                  keys: Object.keys(replyB.message),
+                  raw: replyB.message,
+                } : null,
+                messageTimestamp: replyB?.messageTimestamp,
+                participant: replyB?.participant,
+                status: replyB?.status,
+              },
+              // Inspeção recursiva de replyB.message buscando contextInfo/stanzaId/quotedMessage em TODOS os níveis
+              replyB_recursive_inspection: replyB?.message ? inspectMessageRecursively(replyB.message) : null,
+            };
+            fs.appendFileSync(captureFile, JSON.stringify(replyBCapture) + '\\n');
+          } catch (e: any) {
+            if (!sentB) sentB_error = e?.message || String(e);
+            else replyB_error = e?.message || String(e);
+          }
+
+          // Aguarda respostas aparecerem no messages.upsert
+          await new Promise(r => setTimeout(r, 5000));
+
+          // Captura eventos via arquivo — reutiliza as variáveis já declaradas acima (capturesFile, quotePass, quoteStanzaId)
+          let responseId: string | undefined = undefined;
+          let responseFromMe: boolean | undefined = undefined;
+          try {
+            if (fs.existsSync(capturesFile)) {
+              const lines = fs.readFileSync(capturesFile, 'utf8').trim().split('\n').filter(Boolean);
+              for (const line of lines.slice(-20)) {
+                try {
+                  const cap = JSON.parse(line);
+                  if (cap.type === 'messages.upsert' && cap.msgKey && cap.contextInfo?.stanzaId) {
+                    // Verifica se esta resposta cita a mensagem original do TESTE 1B
+                    if (sentB && cap.contextInfo.stanzaId === sentB.key?.id) {
+                      quotePass = true;
+                      quoteStanzaId = cap.contextInfo.stanzaId;
+                    }
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+
+          const testResult = {
+            ok: true,
+            test: 'TESTE_1_ISOLADO_QUOTE',
+            platform,
+            chatId,
+            test1a: {
+              marker: `LAB_NO_QUOTE_...`,
+              sendMessage: sentA ? 'OK' : 'FAIL',
+              msgId: sentA?.key?.id || null,
+              error: sentA_error,
+            },
+            test1b: {
+              marker: `LAB_QUOTE_ORIGINAL_...`,
+              sendMessageOriginal: sentB ? 'OK' : 'FAIL',
+              originalMsgId: sentB?.key?.id || null,
+              originalKey: sentB?.key || null,
+              originalMessageKeys: sentB?.message ? Object.keys(sentB?.message || {}) : null,
+              sendMessageReply: replyB ? 'OK' : 'FAIL',
+              replyMsgId: replyB?.key?.id || null,
+              replyError: replyB_error,
+              quotedSent: sentB ? true : false,
+            },
+            quote: {
+              status: quotePass ? 'PASS_QUOTE' : 'FAIL_QUOTE_NOT_PRESENT',
+              expectedStanzaId: sentB?.key?.id || null,
+              receivedStanzaId: quoteStanzaId || null,
+              match: quotePass,
+              note: quotePass ? 'Quote confirmado (response.contextInfo.stanzaId === original.key.id)' : 'Quote NÃO confirmado — resposta não contém stanzaId apontando para original',
+            },
+          };
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(testResult, null, 2));
+          return;
+        }
+
+
+        // (TESTE_2 removido — substituído pelo TESTE_3 que compara diretamente sem hooks)
+
+        // ─── Endpoint de comando de teste (existente) ───
+        // ─── TESTE 3 — COMPARAÇÃO DECISIVA: direto vs PlatformManager ───
+        if (req.url === '/lab/test3/compare-quotes') {
+          const platform = parsedBody.platform || 'whatsapp';
+          const chatId = parsedBody.chatId || '120363410094452673@g.us';
+          const adapter = pm.getAdapter(platform as any);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          const adapterAny = adapter as any;
+          const sock = adapterAny.connection?.getSock?.() || adapterAny.sock || null;
+          if (!sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Socket não disponível' }));
+            return;
+          }
+
+          const laboratorioDir = path.join(process.cwd(), 'laboratorio');
+          if (!fs.existsSync(laboratorioDir)) fs.mkdirSync(laboratorioDir, { recursive: true });
+          const test3File = path.join(laboratorioDir, 'test3-compare.jsonl');
+          if (fs.existsSync(test3File)) fs.writeFileSync(test3File, '');
+
+          // Coletor de eventos para observar o que o Baileys efetivamente recebe
+          const observedEvents: any[] = [];
+          const collector = (eventName: string) => (ev: any) => {
+            try {
+              for (const msg of (ev.messages || [])) {
+                const cinfo = msg?.message?.extendedTextMessage?.contextInfo
+                  || msg?.message?.imageMessage?.contextInfo
+                  || msg?.message?.videoMessage?.contextInfo
+                  || msg?.message?.documentMessage?.contextInfo
+                  || msg?.message?.audioMessage?.contextInfo
+                  || msg?.message?.stickerMessage?.contextInfo
+                  || (msg?.message?.conversation !== undefined ? { stanzaId: null, inlined: true } : null)
+                  || null;
+                const entry = {
+                  observedAt: Date.now(),
+                  sourceEvent: eventName,
+                  key: msg.key,
+                  messageType: Object.keys(msg.message || {}),
+                  contextInfo: cinfo,
+                };
+                observedEvents.push(entry);
+                fs.appendFileSync(test3File, JSON.stringify(entry) + '\n');
+              }
+            } catch {}
+          };
+          sock.ev.on('messages.upsert', collector('messages.upsert'));
+          sock.ev.on('messages.update', collector('messages.update'));
+
+          // ─── A) CAMINHO DIRETO ───
+          const markerA = `LAB_DIRECT_${Date.now()}`;
+          let sentDirect: any = null;
+          try {
+            sentDirect = await sock.sendMessage(chatId, { text: markerA });
+          } catch (e: any) {}
+          await new Promise(r => setTimeout(r, 1000));
+
+          let replyDirect: any = null;
+          try {
+            replyDirect = await sock.sendMessage(chatId, { text: `LAB_DIRECT_QUOTE_${Date.now()}` }, { quoted: sentDirect });
+          } catch (e: any) {}
+          await new Promise(r => setTimeout(r, 2000));
+
+          // ─── B) CAMINHO PLATFORMMANAGER ───
+          const markerB = `LAB_PM_${Date.now()}`;
+          let sentPM: any = null;
+          try {
+            sentPM = await sock.sendMessage(chatId, { text: markerB });
+          } catch (e: any) {}
+          await new Promise(r => setTimeout(r, 1000));
+
+          // Criar PlatformMessage artificial com raw=sentPM
+          const fakeMessage: any = {
+            id: sentPM?.key?.id,
+            platform: adapter.platform,
+            chatId,
+            userId: chatId,
+            userName: 'LabTest',
+            text: '$ping',
+            timestamp: new Date(),
+            isFromMe: false,
+            forceProcess: true,
+            isCommand: true,
+            hasMedia: false,
+            raw: sentPM,
+          };
+
+          let pmError: string | null = null;
+          const prevLabModeTest3 = process.env.WPP_LAB_MODE;
+          try {
+            process.env.WPP_LAB_MODE = '1';
+            await pm.handleIncomingMessage(fakeMessage);
+          } catch (e: any) {
+            pmError = e?.message || String(e);
+          } finally {
+            if (prevLabModeTest3 === undefined) {
+              delete process.env.WPP_LAB_MODE;
+            } else {
+              process.env.WPP_LAB_MODE = prevLabModeTest3;
+            }
+          }
+          await new Promise(r => setTimeout(r, 2000));
+
+          // Remover listener
+          sock.ev.removeAllListeners('messages.upsert');
+          sock.ev.removeAllListeners('messages.update');
+
+          // ─── ANÁLISE ───
+          const findReplyTo = (sentKey: any) => {
+            const target = sentKey?.id;
+            if (!target) return null;
+            for (const ev of observedEvents) {
+              if (ev.key?.fromMe && ev.contextInfo?.stanzaId === target) {
+                return ev;
+              }
+            }
+            return null;
+          };
+
+          const directObserved = findReplyTo(sentDirect?.key);
+          const pmObserved = findReplyTo(sentPM?.key);
+
+          const directPass = directObserved?.contextInfo?.stanzaId === sentDirect?.key?.id;
+          const pmPass = pmObserved?.contextInfo?.stanzaId === sentPM?.key?.id;
+
+          // Comparação estrutural
+          let structuralDiff: any = null;
+          if (directObserved?.contextInfo && pmObserved?.contextInfo) {
+            const d = directObserved.contextInfo;
+            const p = pmObserved.contextInfo;
+            structuralDiff = {
+              directHasQuotedMessage: !!d.quotedMessage,
+              pmHasQuotedMessage: !!p.quotedMessage,
+              directQuotedMsgType: d.quotedMessage ? Object.keys(d.quotedMessage)[0] : null,
+              pmQuotedMsgType: p.quotedMessage ? Object.keys(p.quotedMessage)[0] : null,
+              directQuotedText: d.quotedMessage?.extendedTextMessage?.text || d.quotedMessage?.conversation || null,
+              pmQuotedText: p.quotedMessage?.extendedTextMessage?.text || p.quotedMessage?.conversation || null,
+              directParticipant: d.participant,
+              pmParticipant: p.participant,
+              directStanzaIdLen: d.stanzaId?.length,
+              pmStanzaIdLen: p.stanzaId?.length,
+              directStanzaId: d.stanzaId,
+              pmStanzaId: p.stanzaId,
+              sameStanzaIdLength: d.stanzaId?.length === p.stanzaId?.length,
+              sameParticipant: d.participant === p.participant,
+              sameQuotedMsgType: (d.quotedMessage ? Object.keys(d.quotedMessage)[0] : null) === (p.quotedMessage ? Object.keys(p.quotedMessage)[0] : null),
+              sameQuotedText: (d.quotedMessage?.extendedTextMessage?.text || d.quotedMessage?.conversation || null) === (p.quotedMessage?.extendedTextMessage?.text || p.quotedMessage?.conversation || null),
+            };
+          }
+
+          const result = {
+            ok: true,
+            test: 'TESTE_3_COMPARE_QUOTES',
+            platform,
+            chatId,
+            direct: {
+              sentKey: sentDirect?.key?.id || null,
+              observed: directObserved ? {
+                keyId: directObserved.key?.id,
+                stanzaId: directObserved.contextInfo?.stanzaId,
+                quotedMessage: directObserved.contextInfo?.quotedMessage ? 'present' : 'absent',
+                quotedMsgType: directObserved.contextInfo?.quotedMessage ? Object.keys(directObserved.contextInfo.quotedMessage)[0] : null,
+                participant: directObserved.contextInfo?.participant,
+              } : null,
+              result: directPass ? 'PASS' : 'FAIL',
+            },
+            platformManager: {
+              sentKey: sentPM?.key?.id || null,
+              observed: pmObserved ? {
+                keyId: pmObserved.key?.id,
+                stanzaId: pmObserved.contextInfo?.stanzaId,
+                quotedMessage: pmObserved.contextInfo?.quotedMessage ? 'present' : 'absent',
+                quotedMsgType: pmObserved.contextInfo?.quotedMessage ? Object.keys(pmObserved.contextInfo.quotedMessage)[0] : null,
+                participant: pmObserved.contextInfo?.participant,
+              } : null,
+              result: pmPass ? 'PASS' : 'FAIL',
+              error: pmError,
+            },
+            comparison: {
+              directPass,
+              pmPass,
+              bothPass: directPass && pmPass,
+              structurallyEquivalent: structuralDiff
+                ? (structuralDiff.sameStanzaIdLength && structuralDiff.sameParticipant && structuralDiff.sameQuotedMsgType && structuralDiff.sameQuotedText)
+                : null,
+              diffDetails: structuralDiff,
+            },
+            totalObservedEvents: observedEvents.length,
+            allEvents: observedEvents.map(e => ({
+              observedAt: e.observedAt,
+              sourceEvent: e.sourceEvent,
+              keyId: e.key?.id,
+              fromMe: e.key?.fromMe,
+              stanzaId: e.contextInfo?.stanzaId,
+              hasQuotedMessage: !!e.contextInfo?.quotedMessage,
+            })),
+          };
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        // ─── Endpoint de desconexão controlada (para teste de reconnect) ───
+        if (req.url === '/lab/disconnect-socket') {
+          const { platform } = parsedBody;
+          if (!platform) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing platform' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock(platform);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          if (!sock) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Socket não disponível' }));
+            return;
+          }
+          logInfo(`[TestServer] 🔌 Desconexão controlada do socket ${platform}`);
+          try {
+            // Fecha o socket - NÃO apaga sessão, NÃO desloga
+            // O handleClose do adapter deve detectar e agendar reconnect
+            if (typeof sock.end === 'function') {
+              sock.end();
+            } else if (typeof sock.disconnect === 'function') {
+              sock.disconnect();
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, message: 'Socket desconectado controladamente' }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── Probe de mentions (bug do Welcome — Incerteza 4: LID) ──────────
+        // Envia 3 mensagens DIRETAS ao LAB via sock.sendMessage, contornando o
+        // pipeline do welcome: isola a questão "qual combinação texto+JID o
+        // cliente renderiza em grupo LID?". Inspeção VISUAL no grupo decide.
+        //   PROBE_A: handle PN  + mentions PN
+        //   PROBE_B: handle PN  + mentions LID
+        //   PROBE_C: handle LID + mentions LID
+        if (req.url === '/lab/probe-mentions') {
+          const { phone } = parsedBody;
+          if (!phone || !/^\d+$/.test(String(phone))) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing phone (apenas dígitos)' }));
+            return;
+          }
+          const { adapter, sock } = getAdapterAndSock('whatsapp');
+          if (!adapter || !sock) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Adapter/socket indisponível' }));
+            return;
+          }
+          try {
+            // PN e LID reais via chatManager (onWhatsApp)
+            const info = await (adapter as any).getNumberId?.(String(phone)) || null;
+            let pnJid = info?.serialized || `${phone}@s.whatsapp.net`;
+            let lidRaw = info?.lid;
+            // Fallback: onWhatsApp não expõe LID para toda conta (ex.: o
+            // próprio bot). Participants do LAB têm o mapeamento LID↔PN real
+            // (mesma resolução do /lab/antibot-test).
+            if (!lidRaw) {
+              try {
+                const chat = await (adapter as any).client?.getChat?.(LAB_GROUP_ID);
+                const want = String(phone).replace(/\D/g, '');
+                const hit = ((chat as any)?.participants || []).find((p: any) =>
+                  String(p?.phoneNumber || '').replace(/\D/g, '') === want);
+                if (hit && String(hit.id || '').endsWith('@lid')) {
+                  lidRaw = hit.id;
+                  logInfo('[TestServer] /lab/probe-mentions: LID resolvido via participants', { phone, lidRaw });
+                }
+              } catch { /* segue sem LID */ }
+            }
+            const lidJid = lidRaw
+              ? (String(lidRaw).includes('@') ? String(lidRaw) : `${lidRaw}@lid`)
+              : null;
+            const handlePn = `@${phone}`;
+            const rA = await sock.sendMessage(LAB_GROUP_ID, {
+              text: `PROBE_A ${handlePn} (mentions=PN ${pnJid})`, mentions: [pnJid],
+            });
+            let rB: any = null;
+            let rC: any = null;
+            if (lidJid) {
+              rB = await sock.sendMessage(LAB_GROUP_ID, {
+                text: `PROBE_B ${handlePn} (mentions=LID ${lidJid})`, mentions: [lidJid],
+              });
+              const handleLid = `@${String(lidRaw).replace(/@.*$/, '')}`;
+              rC = await sock.sendMessage(LAB_GROUP_ID, {
+                text: `PROBE_C ${handleLid} (mentions=LID ${lidJid})`, mentions: [lidJid],
+              });
+            }
+            logInfo('[TestServer] /lab/probe-mentions enviado', { phone, pnJid, lidJid });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, phone, info, pnJid, lidJid,
+              msgA: rA?.key?.id || null, msgB: rB?.key?.id || null, msgC: rC?.key?.id || null }));
+          } catch (err: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err?.message || String(err) }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de injeção de evento de participante (lab) ────────────
+        // Dispara o handler de produção com evento sintético.
+        //   action='add' → bem-vindo · action='remove' → feedback de saída.
+        if (req.url === '/lab/inject-participant-event') {
+          try {
+            const { adapter } = getAdapterAndSock('whatsapp');
+            const out = await injectParticipantEvent(adapter, parsedBody);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(out));
+          } catch (err: any) {
+            const status = err instanceof LabError ? err.status : 500;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de injeção de mensagem (lab) ──────────────────────────
+        // Despacha mensagem sintética pelo normalizer real (sarcasmo/mute/comandos).
+        if (req.url === '/lab/inject-message') {
+          try {
+            const { adapter } = getAdapterAndSock('whatsapp');
+            const out = await injectMessage(adapter, parsedBody);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(out));
+          } catch (err: any) {
+            const status = err instanceof LabError ? err.status : 500;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // ─── Endpoint de comando de teste (existente) ───
+        const { platform, command } = parsedBody;
+        if (!platform || !command) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing platform or command' }));
+          return;
+        }
+        const trimmed = command.trim();
+        if (!trimmed.startsWith('$')) {
+          // Mensagem comum (não é comando) - enviar diretamente sem processar
+          const adapter = pm.getAdapter(platform as any);
+          if (!adapter) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+            return;
+          }
+          const chatId = parsedBody.chatId || '120363410094452673@g.us';
+          logInfo(`[TestServer] Enviando mensagem: "${trimmed}" para ${chatId}`);
+          const result = await pm.sendMessageAndProcess(platform, chatId, trimmed, false);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, platform, command: trimmed, result }));
+          return;
+        }
+        const adapter = pm.getAdapter(platform as any);
+        if (!adapter) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Plataforma não encontrada: ${platform}` }));
+          return;
+        }
+        const result = await pm.sendMessageAndProcess(platform, parsedBody.chatId, command, true, parsedBody.asUserId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, platform, command, result }));
+    } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+  });
+
+  server.listen(port, '127.0.0.1', () => {
+    logInfo(`[TestServer] Servidor de testes iniciado`, { port });
+    logInfo(`[TestServer] endpoints: /test, /lab/find-message, /lab/messages, /lab/delete-message, /lab/delete-e2e, /lab/adapter, /lab/groups, /lab/stats, /lab/test1/isolated-quote, /lab/test3/compare-quotes`);
+  });
+
+  return server;
+}

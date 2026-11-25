@@ -1,0 +1,357 @@
+/**
+ * Testes do welcome configurável por grupo + listener de entrada de membros.
+ *
+ * Cobre o Problema 1: o evento `group-participants.update` não existia e o
+ * `memberJoinService` era código morto. Agora o fluxo é:
+ *   Baileys → BaileysConnection → BaileysAdapter → memberJoinService → welcome
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// ─── Mock do databaseService (config do grupo + ban) ───
+const store = {
+  mod: new Map<string, any>(),
+  bans: new Set<string>(),
+  joins: [] as any[],
+};
+// toggles presentation_enabled por grupo (lidos pelo getDb mockado abaixo)
+const presentationToggles = new Set<string>();
+
+vi.mock('../../src/services/databaseService', () => ({
+  getGroupMod: vi.fn(async (groupId: string) => store.mod.get(groupId) || {}),
+  isUserBanned: vi.fn(async (g: string, u: string) => store.bans.has(`${g}|${u}`)),
+  banUser: vi.fn(async () => {}),
+  recordMemberJoin: vi.fn(async (g: string, u: string) => { store.joins.push({ g, u }); }),
+  recordMemberRemove: vi.fn(async () => {}),
+  // isPresentationEnabled/getPresentationMessage (welcomeService real) leem via
+  // getDb — mini-DB mockado com os toggles/colunas que o fluxo consulta.
+  getDb: vi.fn(async () => ({
+    get: async (sql: string, params: any[]) => {
+      const s = String(sql);
+      const gid = String(params?.[0] ?? '');
+      if (s.includes('presentation_enabled')) {
+        return presentationToggles.has(gid) ? { presentation_enabled: 1 } : { presentation_enabled: 0 };
+      }
+      if (s.includes('presentation_message')) return null; // default
+      if (s.includes('welcome_message')) return null; // default
+      return null;
+    },
+    run: async () => {},
+  })),
+  ensureGroupModRow: vi.fn(async (g: string) => g),
+}));
+
+vi.mock('../../src/services/loggerService', () => ({
+  default: { info: () => {}, warn: () => {}, error: () => {} },
+  logInfo: () => {}, logWarning: () => {}, logError: () => {},
+}));
+
+// welcomeService usa getDb() — mockamos só as duas funções usadas pelo fluxo
+const welcomeStore = new Map<string, string | null>();
+vi.mock('../../src/services/welcomeService', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+    ...actual,
+    getWelcomeMessage: vi.fn(async (g: string) => welcomeStore.get(g) ?? null),
+    setWelcomeMessage: vi.fn(async (g: string, t: string | null) => { welcomeStore.set(g, t); }),
+    resolveWelcome: vi.fn(async (g: string, ctx: any) => {
+      const custom = welcomeStore.get(g) ?? null;
+      const template = custom ?? actual.DEFAULT_WELCOME;
+      return { text: actual.renderWelcome(template, ctx), isDefault: custom === null };
+    }),
+  };
+});
+
+const GRUPO_A = '120363419033272638@g.us';
+const GRUPO_B = '120363410094452673@g.us';
+
+async function loadService() {
+  vi.resetModules();
+  return await import('../../src/services/memberJoinService');
+}
+
+function makeCtx() {
+  const sent: Array<{ groupId: string; text: string; mentions?: string[] }> = [];
+  const removed: string[] = [];
+  return {
+    sent, removed,
+    removeParticipant: vi.fn(async (g: string, u: string) => { removed.push(u); }),
+    sendMessage: vi.fn(async (g: string, t: string, m?: string[]) => { sent.push({ groupId: g, text: t, mentions: m }); }),
+    resolveGroupName: vi.fn(async () => 'Figurinhas/Stickers'),
+  };
+}
+
+beforeEach(() => {
+  store.mod.clear();
+  store.bans.clear();
+  store.joins.length = 0;
+  welcomeStore.clear();
+});
+
+describe('welcome — padrão do sistema', () => {
+  it('3. o welcome padrão é EXATAMENTE "Boas-vindas @novato 👋"', async () => {
+    const { DEFAULT_WELCOME } = await import('../../src/services/welcomeService');
+    expect(DEFAULT_WELCOME).toBe('Boas-vindas @novato 👋');
+  });
+
+  it('2. novo membro com bemvindo=1 recebe o welcome padrão', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net', name: 'Daniel' }] });
+
+    expect(ctx.sent.length).toBe(1);
+    expect(ctx.sent[0].text).toBe('Boas-vindas @6285822480546 👋');  // handle real (bug do Welcome)
+  });
+
+  it('4. welcome OFF (bemvindo=0) NÃO envia nada', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: false });
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net' }] });
+
+    expect(ctx.sent.length).toBe(0);
+  });
+
+  it('1. o membro é registrado na entrada (recordMemberJoin)', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net' }] });
+
+    expect(store.joins.length).toBe(1);
+    expect(store.joins[0].u).toBe('6285822480546@s.whatsapp.net');
+  });
+
+  it('evento sem membros não faz nada', async () => {
+    const { handleMemberJoin } = await loadService();
+    const ctx = makeCtx();
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [] });
+    expect(ctx.sent.length).toBe(0);
+  });
+});
+
+describe('welcome — configurável por grupo', () => {
+  it('8. config de um grupo NÃO afeta outro', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    store.mod.set(GRUPO_B, { bemvindo: true });
+    welcomeStore.set(GRUPO_A, 'Bem-vindo ao A!');
+
+    const ctxA = makeCtx();
+    await handleMemberJoin(ctxA as any, { groupId: GRUPO_A, members: [{ id: 'x@s.whatsapp.net' }] });
+    const ctxB = makeCtx();
+    await handleMemberJoin(ctxB as any, { groupId: GRUPO_B, members: [{ id: 'x@s.whatsapp.net' }] });
+
+    expect(ctxA.sent[0].text).toBe('Bem-vindo ao A!');            // personalizado
+    expect(ctxB.sent[0].text).toBe('Boas-vindas @novato 👋');        // padrão
+  });
+
+  it('placeholders {nome}, {numero}, {grupo} são aplicados', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    welcomeStore.set(GRUPO_A, 'Olá {nome} ({numero}) — bem-vindo ao {grupo}!');
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, {
+      groupId: GRUPO_A,
+      members: [{ id: '6285822480546@s.whatsapp.net', name: 'Daniel', phoneNumber: '6285822480546@s.whatsapp.net' }],
+    });
+
+    expect(ctx.sent[0].text).toBe('Olá Daniel (6285822480546) — bem-vindo ao Figurinhas/Stickers!');
+  });
+});
+
+describe('welcome — handle de menção (bug do Welcome)', () => {
+  it('mentions com o JID do novato chega ao sendMessage', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net', name: 'Daniel' }] });
+
+    expect(ctx.sent[0].mentions).toEqual(['6285822480546@s.whatsapp.net']);
+  });
+
+  it('custom com @novato literal ganha o handle real', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    welcomeStore.set(GRUPO_A, 'Bem-vindo @novato! Boa sorte.');
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net', name: 'Daniel' }] });
+
+    expect(ctx.sent[0].text).toBe('Bem-vindo @6285822480546! Boa sorte.');
+    expect(ctx.sent[0].mentions).toEqual(['6285822480546@s.whatsapp.net']);
+  });
+
+  it('custom com {handle} usa o placeholder', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    welcomeStore.set(GRUPO_A, 'Oi {handle}, aproveite o {grupo}!');
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net', name: 'Daniel' }] });
+
+    expect(ctx.sent[0].text).toBe('Oi @6285822480546, aproveite o Figurinhas/Stickers!');
+  });
+
+  it('grupo LID: resolvePn converte @lid → PN no handle e no mentions', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    const ctx = makeCtx();
+    ctx.resolvePn = async (jid) =>
+      jid === '2592935567439@lid' ? '558581344211@s.whatsapp.net' : jid;
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '2592935567439@lid', name: 'Novato' }] });
+
+    expect(ctx.sent[0].text).toBe('Boas-vindas @558581344211 👋');
+    expect(ctx.sent[0].mentions).toEqual(['558581344211@s.whatsapp.net']);
+  });
+});
+
+describe('renderWelcome — handle puro', () => {
+  it('{handle} é substituído', async () => {
+    const { renderWelcome } = await import('../../src/services/welcomeService');
+    expect(renderWelcome('Oi {handle}', { numero: '5511' })).toBe('Oi @5511');
+  });
+
+  it('sem numero, @novato permanece literal (guard)', async () => {
+    const { renderWelcome } = await import('../../src/services/welcomeService');
+    expect(renderWelcome('Bem-vindo @novato', {})).toBe('Bem-vindo @novato');
+  });
+});
+
+describe('welcome — ban-on-rejoin continua funcionando', () => {
+  it('membro banido é removido e NÃO recebe welcome', async () => {
+    const { handleMemberJoin } = await loadService();
+    store.mod.set(GRUPO_A, { bemvindo: true });
+    store.bans.add(`${GRUPO_A}|6285822480546@s.whatsapp.net`);
+    const ctx = makeCtx();
+
+    await handleMemberJoin(ctx as any, { groupId: GRUPO_A, members: [{ id: '6285822480546@s.whatsapp.net' }] });
+
+    expect(ctx.removed).toContain('6285822480546@s.whatsapp.net');
+    // Banido NÃO recebe welcome — só o aviso de banimento.
+    const welcomes = ctx.sent.filter(s => s.text.startsWith('Bem-vindo'));
+    expect(welcomes.length).toBe(0);
+    expect(ctx.sent.some(s => s.text.includes('banido'))).toBe(true);
+  });
+});
+
+describe('renderWelcome — helper puro', () => {
+  it('placeholder sem valor vira string vazia (nunca "undefined")', async () => {
+    const { renderWelcome } = await import('../../src/services/welcomeService');
+    const out = renderWelcome('Olá {nome}!', {});
+    expect(out).not.toContain('undefined');
+    expect(out).toBe('Olá !');
+  });
+
+  it('é case-insensitive nos placeholders', async () => {
+    const { renderWelcome } = await import('../../src/services/welcomeService');
+    expect(renderWelcome('{NOME} {Numero}', { nome: 'A', numero: '1' })).toBe('A 1');
+  });
+
+  it('normaliza espaços em branco', async () => {
+    const { renderWelcome } = await import('../../src/services/welcomeService');
+    expect(renderWelcome('  Olá   {nome}  ', { nome: 'A' })).toBe('Olá A');
+  });
+});
+
+describe('composeWelcome — design ADITIVO (INC-012b)', () => {
+  it('texto simples ganha o default + linha em branco acima', async () => {
+    const { composeWelcome, DEFAULT_WELCOME } = await import('../../src/services/welcomeService');
+    expect(composeWelcome('Bem-vindo ao grupo!')).toBe(`${DEFAULT_WELCOME}\n\nBem-vindo ao grupo!`);
+  });
+
+  it('idempotente: texto com "Boas-vindas" NÃO ganha prepend duplicado', async () => {
+    const { composeWelcome } = await import('../../src/services/welcomeService');
+    expect(composeWelcome('Boas-vindas pessoal do 085!')).toBe('Boas-vindas pessoal do 085!');
+  });
+
+  it('idempotente: "@novato" e "{handle}" também são template completo', async () => {
+    const { composeWelcome } = await import('../../src/services/welcomeService');
+    expect(composeWelcome('Fala @novato, tranquilo?')).toBe('Fala @novato, tranquilo?');
+    expect(composeWelcome('Oi {handle}, bom ter você')).toBe('Oi {handle}, bom ter você');
+  });
+
+  it('render do composto preserva o \\n\\n e substitui o @novato', async () => {
+    const { composeWelcome, renderWelcome } = await import('../../src/services/welcomeService');
+        const template = composeWelcome('Bem-vindo ao grupo!');
+        const out = renderWelcome(template, { numero: '558581344211' });
+        expect(out).toBe('Boas-vindas @558581344211 👋\n\nBem-vindo ao grupo!');
+      });
+    });
+
+    // ─── P1 (23/10): aviso de apresentação — default aditivo + hook no join ─────
+
+    describe('composePresentationMessage — aditivo (P1)', () => {
+      it('texto vazio → default puro', async () => {
+        const { composePresentationMessage, DEFAULT_PRESENTATION_MESSAGE } = await import('../../src/services/welcomeService');
+        expect(composePresentationMessage('')).toBe(DEFAULT_PRESENTATION_MESSAGE);
+        expect(composePresentationMessage('   ')).toBe(DEFAULT_PRESENTATION_MESSAGE);
+      });
+
+      it('linhas novas do admin → EMBAIXO do default (default não é apagado)', async () => {
+        const { composePresentationMessage, DEFAULT_PRESENTATION_MESSAGE } = await import('../../src/services/welcomeService');
+        const out = composePresentationMessage('Regra extra: sem links');
+        expect(out.startsWith(DEFAULT_PRESENTATION_MESSAGE)).toBe(true);
+        expect(out.endsWith('Regra extra: sem links')).toBe(true);
+      });
+
+      it('texto que JÁ contém o default → não duplica', async () => {
+        const { composePresentationMessage, DEFAULT_PRESENTATION_MESSAGE } = await import('../../src/services/welcomeService');
+        const full = `${DEFAULT_PRESENTATION_MESSAGE}\n\nRegra extra`;
+        expect(composePresentationMessage(full)).toBe(full);
+      });
+
+      it('default contém o link do Telegram do grupo-alvo', async () => {
+        const { DEFAULT_PRESENTATION_MESSAGE } = await import('../../src/services/welcomeService');
+        expect(DEFAULT_PRESENTATION_MESSAGE).toContain('https://t.me/Fortaleza_085/2');
+        expect(DEFAULT_PRESENTATION_MESSAGE).toContain('Para se apresentar');
+      });
+    });
+
+    describe('aviso de apresentação no join (P1 — gate próprio)', () => {
+      beforeEach(() => {
+        store.mod.clear();
+        store.bans.clear();
+        presentationToggles.clear();
+      });
+
+      it('welcome ON + presentation ON → welcome E aviso (2 mensagens, aviso depois)', async () => {
+        store.mod.set(GRUPO_B, { bemvindo: true });
+        presentationToggles.add(GRUPO_B);
+        const ctx = makeCtx();
+        const { handleMemberJoin } = await loadService();
+        await handleMemberJoin(ctx, { groupId: GRUPO_B, members: ['5511999998888@c.us'] });
+
+        expect(ctx.sent.length).toBe(2);
+        expect(ctx.sent[0].text).toContain('Boas-vindas');
+        expect(ctx.sent[1].text).toContain('Para se apresentar');
+        expect(ctx.sent[1].text).toContain('https://t.me/Fortaleza_085/2');
+      });
+
+      it('presentation OFF → só welcome (1 mensagem, sem aviso)', async () => {
+        store.mod.set(GRUPO_B, { bemvindo: true });
+        const ctx = makeCtx();
+        const { handleMemberJoin } = await loadService();
+        await handleMemberJoin(ctx, { groupId: GRUPO_B, members: ['5511999998888@c.us'] });
+
+        expect(ctx.sent.length).toBe(1);
+        expect(ctx.sent[0].text).toContain('Boas-vindas');
+      });
+
+      it('welcome OFF + presentation ON → aviso sai mesmo assim (gate é do aviso, não do welcome)', async () => {
+        store.mod.set(GRUPO_B, { bemvindo: 0 });
+        presentationToggles.add(GRUPO_B);
+        const ctx = makeCtx();
+        const { handleMemberJoin } = await loadService();
+        await handleMemberJoin(ctx, { groupId: GRUPO_B, members: ['5511999998888@c.us'] });
+
+        expect(ctx.sent.length).toBe(1);
+        expect(ctx.sent[0].text).toContain('Para se apresentar');
+      });
+    });

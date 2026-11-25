@@ -1,0 +1,206 @@
+import { ICommand } from './types';
+import { CommandContext } from '../../platforms/base/PlatformTypes';
+
+// Importar todos os comandos
+import { helpCommand } from './help';
+import { menuCommand } from './menu';
+import { pingCommand } from './ping';
+import { aliveCommand } from './alive';
+import { banCommand } from './ban';
+import { kickCommand } from './kick';
+import { muteCommand } from './mute';
+import { promoteCommand } from './promover';
+import { forcaCommand } from './forca';
+import { velhaCommand } from './velha';
+import { sorteioCommand } from './sorteio';
+import { climaCommand } from './clima';
+import { feedbackCommand } from './feedback';
+import { statsCommand } from './stats';
+import { perguntaCommand } from './pergunta';
+import { nickCommand } from './nick';
+import { gttsCommand } from './gtts';
+import { ondeEstouCommand } from './ondeestou';
+import { jogosCommand } from './jogos';
+import { jokesCommand } from './jokes';
+import { voteCommand } from './vote';
+import { delVoteCommand } from './vote';
+import { addCmdCommand } from './addcmd';
+import { sendMessageCommand } from './sendMessage';
+import { antispamCommand } from './antispam';
+import { conselhoCommand } from './conselho';
+import { conselhobCommand } from './conselhob';
+import { aleatoriaCommand } from './aleatoria';
+import { alarmeCommand } from './alarme';
+import { lembreteCommand } from './lembrete';
+import { shutdownCommand } from './shutdown';
+import { infoCommand } from './info';
+import { adminCommand } from './admin';
+import { gruposCommand } from './grupos';
+import { noticiasCommand } from './noticias';
+import { banidosCommand } from './banidos';
+import { setwelcomeCommand } from './setwelcome';
+import { setapresentacaoCommand } from './setapresentacao';
+import { cobrarpresentacaoCommand } from './cobrarpresentacao';
+import { ligaoarCommand } from './ligaoar';
+import { ligaoventCommand } from './ligaovent';
+import { figurinhasomCommand } from './figurinhasom';
+import { figurinhaCommand } from './figurinha';
+import { downloadCommand } from './download';
+import { syncnamesCommand } from './syncnames';
+import { enviarhistoricoCommand } from './enviarhistorico';
+import { apresentarCommand } from './apresentar';
+import { apresentacaoCommand } from './apresentacao';
+import { sarcasmoCommand } from './sarcasmo';
+import { listaCommand } from './lista';
+import { transcrevaCommand } from './transcreva';
+import { quizCommand } from './quiz';
+import { bomDiaCommand } from './bomDia';
+import { reacaoCommand } from './reacao';
+import { rankingCommand } from './ranking';
+import { cantadaCommand } from './cantada';
+import { fakechatCommand } from './interacao';
+import { sendCommand } from './send';
+import { cmdToggleCommand } from './cmdToggle';
+import { automodCommand, antispamModCommand, antiestrangeiroModCommand, antilinkModCommand, bemvindoModCommand, anuncioModCommand, punicaoModCommand, antibotModCommand, antistoryModCommand, anticassinoModCommand, auditonlyModCommand,
+  // aliases legados (mesma instância)
+  autolinkModCommand, casinoModCommand, removerModCommand, detectarModCommand } from './modToggle';
+import { screenCommand } from './screen';
+import { deleteMsgCommand } from './deleteMsg';
+import { desmuteCommand } from './desmute';
+
+// Comandos registrados
+const commands: Record<string, ICommand> = {
+  figurinha: figurinhaCommand,
+  criar: figurinhaCommand,
+  figurinhasom: figurinhasomCommand,
+  download: downloadCommand,
+  dl: downloadCommand,
+  syncnames: syncnamesCommand,
+  help: helpCommand,
+  menu: menuCommand,
+  ping: pingCommand,
+  alive: aliveCommand,
+  ban: banCommand,
+  kick: kickCommand,
+  mute: muteCommand,
+  promover: promoteCommand,
+  'forca': forcaCommand,
+  'velha': velhaCommand,
+  'sorteio': sorteioCommand,
+  clima: climaCommand,
+  feedback: feedbackCommand,
+  stats: statsCommand,
+  pergunta: perguntaCommand,
+  nick: nickCommand,
+  gtts: gttsCommand,
+  'ondeestou': ondeEstouCommand,
+  jogos: jogosCommand,
+  jokes: jokesCommand,
+  piada: jokesCommand,
+  vote: voteCommand,
+  votar: voteCommand,
+  delvote: delVoteCommand,
+  voto: voteCommand,
+  delvoto: delVoteCommand,
+  addcmd: addCmdCommand,
+  sendmsg: sendMessageCommand,
+  ratelimit: antispamCommand,
+  conselho: conselhoCommand,
+  conselhob: conselhobCommand,
+  aleatoria: aleatoriaCommand,
+  alarme: alarmeCommand,
+  lembrete: lembreteCommand,
+  shutdown: shutdownCommand,
+  info: infoCommand,
+  admin: adminCommand,
+  grupos: gruposCommand,
+  noticias: noticiasCommand,
+  banidos: banidosCommand,
+  setwelcome: setwelcomeCommand,
+  setapresentacao: setapresentacaoCommand,
+  cobrarpresentacao: cobrarpresentacaoCommand,
+    apresentar: apresentarCommand,
+    apresentacao: apresentacaoCommand,
+  cantada: cantadaCommand,
+  fakechat: fakechatCommand,
+  send: sendCommand,
+  cmdtoggle: cmdToggleCommand,
+  automod: automodCommand,
+  antispam: antispamModCommand,
+  antiestrangeiro: antiestrangeiroModCommand,
+  // Nomes OFICIAIS (PT-BR)
+  antilink: antilinkModCommand,
+  antibot: antibotModCommand,
+  antistory: antistoryModCommand,
+  anticassino: anticassinoModCommand,
+  punicao: punicaoModCommand,
+  anuncio: anuncioModCommand,
+  auditonly: auditonlyModCommand,
+  bemvindo: bemvindoModCommand,
+  sarcasmo: sarcasmoCommand,
+  lista: listaCommand,
+  transcreva: transcrevaCommand,
+  quiz: quizCommand,
+  bomdia: bomDiaCommand,
+  reacao: reacaoCommand,
+  ranking: rankingCommand,
+  // Aliases LEGADOS (compatibilidade — mesmo comportamento)
+  autolink: autolinkModCommand,
+  casino: casinoModCommand,
+  remover: removerModCommand,
+  detectar: detectarModCommand,
+  delete: deleteMsgCommand,
+    desmute: desmuteCommand,
+    screen: screenCommand,
+  };
+
+// Registrar comandos personalizados
+import { getComandoBlock, addComandosId, addComandos, getComando, listComandos, removeComando } from './customCommandsStore';
+import { logWarning } from '../../services/loggerService';
+
+// Função principal para obter comando
+export function getCommand(name: string): ICommand | undefined {
+  const command = commands[name.toLowerCase()];
+  if (command) {
+    return command;
+  }
+
+  // Buscar comando personalizado
+  return undefined;
+}
+
+// Exportar loadCommands para compatibilidade com PlatformManager
+export function loadFunCommands(): Map<string, ICommand> {
+  return new Map<string, ICommand>([
+    ['ligaoar', ligaoarCommand],
+    ['ligaovent', ligaoventCommand],
+    ['enviarhistorico', enviarhistoricoCommand],
+  ]);
+}
+
+export function loadCommands(): Map<string, ICommand> {
+  const commandsMap = new Map<string, ICommand>();
+  const seenCommands = new Set<ICommand>();
+  for (const [name, command] of Object.entries(commands)) {
+    commandsMap.set(name, command);
+    seenCommands.add(command);
+  }
+  // Adicionar screen command (apenas uma vez, mesmo sendo alias)
+  if (!seenCommands.has(screenCommand)) {
+    seenCommands.add(screenCommand);
+    commandsMap.set('screen', screenCommand);
+    commandsMap.set('screenshare', screenCommand);
+    commandsMap.set('share', screenCommand);
+  }
+  return commandsMap;
+}
+
+export {
+  helpCommand, menuCommand, pingCommand, aliveCommand, banCommand, kickCommand, muteCommand, promoteCommand,
+  forcaCommand, velhaCommand, sorteioCommand, climaCommand, feedbackCommand, statsCommand, perguntaCommand,
+  nickCommand, gttsCommand, ondeEstouCommand, jogosCommand, jokesCommand, voteCommand, delVoteCommand,
+  addCmdCommand, antispamCommand, conselhoCommand, conselhobCommand, aleatoriaCommand,
+  alarmeCommand, lembreteCommand, shutdownCommand, infoCommand, adminCommand,
+  gruposCommand, noticiasCommand, banidosCommand, setwelcomeCommand, cantadaCommand, fakechatCommand, sendCommand,
+  cmdToggleCommand, sendMessageCommand,
+};
