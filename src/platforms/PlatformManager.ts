@@ -1,0 +1,984 @@
+/**
+ * 🔒 WarriorBlack - Platform Manager
+ *
+ * Orquestrador singleton para gerenciar múltiplas plataformas (WhatsApp, Telegram, Discord)
+ */
+
+import {
+  PlatformType,
+  PlatformAdapter,
+  PlatformClient,
+  PlatformMessage,
+  PlatformChat,
+  PlatformUser,
+  CommandContext,
+  ICommand,
+  SendOptions,
+  MediaPayload,
+  MessageHandler
+} from './base/PlatformTypes';
+import { rateLimiter } from '../services/rateLimiter';
+import { isFullEdition, isPremiumCommand, demoMessage } from '../services/licenseService';
+import { commandConfigService } from '../services/commandConfigService';
+import metricsService from '../services/metricsService';
+import { isMaster } from '../services/permissions';
+import { isSenderGroupAdmin } from '../services/groupAdmin';
+import logger, { logInfo, logError, logWarning } from '../services/loggerService';
+import { handleKeywords } from '../services/keywordHandler';
+
+type AdapterFactory = () => Promise<PlatformAdapter>;
+
+export class PlatformManager {
+  private static instance: PlatformManager;
+  private adapters = new Map<PlatformType, PlatformAdapter>();
+  private messageHandlers: MessageHandler[] = [];
+  private readyHandlers: Array<() => void> = [];
+  private disconnectedHandlers: Array<(platform: PlatformType, reason: string) => void> = [];
+  private commandRegistry = new Map<string, ICommand>();
+  private funCommandRegistry = new Map<string, ICommand>(); // comandos '#' (zoeira/midia)
+  private initialized = false;
+  // Rastreia o último chatId visto em cada plataforma (para comandos de ponte como $send)
+  private lastChatByPlatform = new Map<PlatformType, string>();
+
+  private constructor() {}
+
+  static getInstance(): PlatformManager {
+    if (!PlatformManager.instance) {
+      PlatformManager.instance = new PlatformManager();
+    }
+    return PlatformManager.instance;
+  }
+
+  /**
+   * Registra um adapter de plataforma
+   */
+  registerAdapter(adapter: PlatformAdapter): void {
+    if (this.adapters.has(adapter.platform)) {
+      logWarning(`[PlatformManager] Adapter para ${adapter.platform} já registrado, substituindo...`);
+    }
+    this.adapters.set(adapter.platform, adapter);
+    logger.info(`[PlatformManager] Adapter registrado: ${adapter.platform}`);
+    
+    // NOTA: Os handlers são configurados internamente pelo adapter
+    // Não precisamos conectar aqui pois o adapter já implementa PlatformClient
+    // e configura seus próprios handlers no setupEventHandlers
+  }
+
+  /**
+   * Registra factory para inicialização lazy
+   */
+  registerAdapterFactory(platform: PlatformType, factory: AdapterFactory): void {
+    // Armazenar para inicialização posterior
+    (this as any)[`_factory_${platform}`] = factory;
+  }
+
+  /**
+   * Inicializa todas as plataformas registradas
+   */
+  async startAll(): Promise<void> {
+    if (this.initialized) {
+      logWarning('[PlatformManager] Já inicializado');
+      return;
+    }
+
+    logger.info('[PlatformManager] Iniciando todas as plataformas...');
+
+    // Inicializar em PARALELO (allSettled) para que uma plataforma lenta/travada
+    // (ex: Telegram launch() aguardando ready) não bloqueie as demais (Discord/WPP).
+    const results = await Promise.allSettled(
+      Array.from(this.adapters.entries()).map(async ([platform, adapter]) => {
+        try {
+          logger.info(`[PlatformManager] Inicializando ${platform}...`);
+          await adapter.initialize();
+          logger.info(`[PlatformManager] ✅ ${platform} pronto`);
+        } catch (error) {
+          logError(`StartAll:${platform}`, error);
+          // Continua com as outras plataformas
+        } finally {
+          // INC-016: registra o handler MESMO se o initialize falhar no meio
+          // (ex.: fluxo de pareamento — o socket de registro fecha após o
+          // scan e o initialize rejeita, mas o adapter reconecta sozinho).
+          // Sem isso o PM nunca processa mensagens da plataforma.
+          this.setupAdapterHandlers(adapter);
+        }
+      })
+    );
+
+    // Log de resumo de falhas (se houver)
+    results.forEach((r, i) => {
+      if (r.status === 'rejected') {
+        logError(`StartAll:platforma_${i}`, r.reason);
+      }
+    });
+
+    this.initialized = true;
+    logger.info('[PlatformManager] Todas as plataformas inicializadas');
+  }
+
+  /**
+   * Configura handlers de mensagem para um adapter
+   */
+  private setupAdapterHandlers(adapter: PlatformAdapter): void {
+    const client = adapter.client;
+
+    client.onMessage(async (rawMessage: PlatformMessage) => {
+      const startTs = Date.now();
+      const message = this.enrichMessage(rawMessage, adapter.platform);
+
+      // Telemetria: mensagem recebida
+      metricsService.incrementMessage(adapter.platform);
+      this.lastChatByPlatform.set(adapter.platform, message.chatId);
+
+      // ─── Detecção de mensagem própria (loop prevention) ───
+        // Mensagens do próprio bot NUNCA devem ser reprocessadas
+        // EXCETO em modo laboratório (WPP_LAB_MODE=1) para testes
+        const isLabMode = process.env.WPP_LAB_MODE === '1';
+        if (message.isFromMe && !isLabMode) {
+          logInfo(`[PM] SKIP mensagem própria: ${message.id} (${message.platform})`);
+          return;
+        }
+
+      // ─── Detectar tipo de gatilho ───
+      // Preencher isCommand/commandName ANTES de detectar o gatilho
+      const trimmedText = message.text.trim();
+      const prefix = trimmedText.startsWith('$') ? '$' : trimmedText.startsWith('#') ? '#' : '';
+      message.commandPrefix = prefix || undefined;
+      message.isCommand = Boolean(prefix);
+      if (message.isCommand) {
+        const parts = trimmedText.slice(1).trim().split(/ +/);
+        message.commandName = (parts.shift() || '').toLowerCase();
+        message.args = parts;
+      }
+
+      const trigger = this.detectTrigger(message, adapter);
+      logInfo(`[PM] trigger=${trigger} msgId=${message.id} fromMe=${message.isFromMe} text=${message.text?.substring(0,30)}`);
+      
+      // ─── Interação comum: reaction/like ───
+      if (trigger !== 'none' && !message.isFromMe) {
+        await this.sendReaction(message, adapter, trigger);
+      }
+
+      // ─── Processar comando ───
+      if (message.isCommand && message.commandName) {
+        await this.executeCommand(message, adapter);
+      } else if (!message.isFromMe) {
+        // Keywords/saudações (sarcasmo com "bot", "oi" em DM).
+        try {
+          await handleKeywords(
+            {
+              body: message.text,
+              text: message.text,
+              id: { id: message.id },
+              type: message.mediaType,
+              mentions: message.mentions?.map((m: any) => m?.id || m) || [],
+              quotedFromMe: message.quotedFromMe,
+            } as any,
+            {
+              chatId: message.chatId,
+              userId: message.userId,
+              platform: message.platform,
+              reply: async (text: string) => {
+                await adapter.client.sendMessage(message.chatId, text);
+              },
+            }
+          );
+        } catch (e: any) {
+          logWarning(`[PM] keywordHandler falhou: ${e?.message || e}`);
+        }
+      }
+    });
+
+    client.onReady(() => {
+      // Telemetria: conexão de plataforma
+      metricsService.recordPlatformConnection(adapter.platform);
+      logger.info(`[PlatformManager] ${adapter.platform} conectado e pronto`);
+      for (const handler of this.readyHandlers) {
+        try {
+          handler();
+        } catch (error) {
+          logError('ReadyHandler', error);
+        }
+      }
+    });
+
+    client.onDisconnected((reason: string) => {
+      // Telemetria: desconexão de plataforma
+      metricsService.recordPlatformDisconnection(adapter.platform);
+      logger.info(`[PlatformManager] ${adapter.platform} desconectado: ${reason}`);
+      for (const handler of this.disconnectedHandlers) {
+        try {
+          handler(adapter.platform, reason);
+        } catch (error) {
+          logError('DisconnectedHandler', error);
+        }
+      }
+    });
+  }
+
+  /**
+   * Detecta o tipo de gatilho (command, mention, reply)
+   * Centraliza a detecção de interação do usuário
+   */
+  private detectTrigger(message: PlatformMessage, adapter: PlatformAdapter): 'command' | 'mention' | 'reply' | 'none' {
+    // Comando: mensagem começa com $ e tem commandName
+    if (message.isCommand && message.commandName) {
+      return 'command';
+    }
+    
+    // Reply: mensagem responde a uma mensagem do bot (quotedFromMe = true)
+    if (message.replyToMessageId && message.quotedFromMe) {
+      return 'reply';
+    }
+    
+    // Mention: mensagem menciona o bot
+    if (message.mentions && message.mentions.length > 0) {
+      return 'mention';
+    }
+    
+    return 'none';
+  }
+  
+  /**
+   * Envia reação/like na mensagem original
+   * Usa a API do adapter específico para reagir
+   */
+  private async sendReaction(message: PlatformMessage, adapter: PlatformAdapter, trigger: string): Promise<void> {
+    try {
+      if (typeof adapter.client.react !== 'function') {
+        logInfo(`[Reaction] ${message.platform} não suporta react em ${message.id} (${trigger})`);
+        return;
+      }
+      const originalKey = message.raw?.key;
+      await adapter.client.react(message.id, '👍', message.chatId, originalKey);
+      // Só loga sucesso se a Promise resolveu sem erro
+      logInfo(`[Reaction] Reagiu com 👍 em ${message.id} (${trigger})`);
+    } catch (reactErr: any) {
+      logWarning(`[Reaction] erro ao reagir em ${message.id}: ${reactErr?.message}`);
+    }
+  }
+  
+  /**
+   * Envia reply/quote na mensagem original
+   * Usa a API do adapter específico para responder com quote
+   */
+  private async sendReply(message: PlatformMessage, adapter: PlatformAdapter, trigger: string, text: string): Promise<void> {
+    try {
+      await adapter.client.sendMessage(message.chatId, text, {
+        replyToMessageId: message.id,
+        quotedFromMe: false,
+        quotedParticipant: message.userId,
+      });
+      logInfo(`[Reply] Respondido com quote em ${message.id} (${trigger})`);
+    } catch (replyErr: any) {
+      // Fallback: enviar sem quote
+      logWarning(`[Reply] quote falhou, enviando sem quote: ${replyErr?.message}`);
+      await adapter.client.sendMessage(message.chatId, text);
+    }
+  }
+
+  /**
+   * Enriquece mensagem com metadados da plataforma
+   */
+  private enrichMessage(message: PlatformMessage, platform: PlatformType): PlatformMessage {
+    return {
+      ...message,
+      platform,
+      // Garantir IDs com prefixo para evitar conflitos
+      chatId: this.normalizeChatId(message.chatId, platform),
+      userId: this.normalizeUserId(message.userId, platform),
+    };
+  }
+
+  /**
+   * Normaliza chat ID com prefixo da plataforma
+   */
+  private normalizeChatId(chatId: string, platform: PlatformType): string {
+    const prefix = platform.startsWith('whatsapp') ? 'wpp:' : platform === 'telegram' ? 'tg:' : 'dc:';
+    return chatId.startsWith(prefix) ? chatId : `${prefix}${chatId}`;
+  }
+
+  /**
+   * Normaliza user ID com prefixo da plataforma
+   */
+  private normalizeUserId(userId: string, platform: PlatformType): string {
+    const prefix = platform.startsWith('whatsapp') ? 'wpp:' : platform === 'telegram' ? 'tg:' : 'dc:';
+    return userId.startsWith(prefix) ? userId : `${prefix}${userId}`;
+  }
+
+  /**
+   * Obtém prefixo de comando por plataforma
+   * TODOS usam $ para consistência
+   */
+  private getCommandPrefix(platform: PlatformType): string {
+    return '$'; // Todos usam o mesmo prefixo
+  }
+
+  /**
+   * Processa mensagem recebida de qualquer plataforma
+   */
+  async handleIncomingMessage(message: PlatformMessage): Promise<void> {
+    // Ignorar mensagens do próprio bot
+    if (message.isFromMe) return;
+    
+    // Verificar se é comando (começa com $)
+    const PREFIX = '$';
+    if (!message.text || !message.text.trim().startsWith(PREFIX)) return;
+    
+    // Parsear comando e argumentos
+    const parts = message.text.slice(PREFIX.length).trim().split(/\s+/);
+    const commandName = parts[0].toLowerCase();
+    const args = parts.slice(1);
+    
+    // Atualizar mensagem com info do comando
+    message.isCommand = true;
+    message.commandName = commandName;
+    message.args = args;
+    
+    logger.info(`[PlatformManager] Comando recebido: ${commandName} de ${message.userName} (${message.platform})`);
+    
+    // Buscar adapter da plataforma
+    const adapter = this.getAdapter(message.platform);
+    if (!adapter) {
+      logger.error(`[PlatformManager] Adapter não encontrado para ${message.platform} (adapters: ${Array.from(this.adapters.keys()).join(', ')})`);
+      return;
+    }
+    
+    // Executar comando
+    await this.executeCommand(message, adapter);
+  }
+
+  /**
+   * Executa comando se encontrado
+   */
+  private async executeCommand(message: PlatformMessage, adapter: PlatformAdapter): Promise<void> {
+    const startedAt = Date.now();
+    const requestedAlias = message.commandName || 'unknown';
+    const registry = message.commandPrefix === '#' ? this.funCommandRegistry : this.commandRegistry;
+    const command = registry.get(message.commandName!);
+
+    if (!command) {
+      // Comando não encontrado - poderia buscar no relay (futuro)
+      logger.info(`[PlatformManager] Comando não encontrado: ${message.commandName} em ${adapter.platform}`);
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: requestedAlias,
+        commandAlias: requestedAlias,
+        outcome: 'not_found',
+        permissionResult: 'not_checked',
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    // Verificar se comando está disponível nesta plataforma
+    if (command.platforms && !command.platforms.includes(adapter.platform)) {
+      await adapter.client.sendMessage(message.chatId, `⚠️ Comando \`${message.commandName}\` não disponível no ${adapter.platform}.`);
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: command.name,
+        commandAlias: requestedAlias,
+        outcome: 'unsupported',
+        permissionResult: 'not_checked',
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    // Gate de edição: recursos premium só com WPP_EDITION=full (dono).
+    if (!isFullEdition() && isPremiumCommand(command.name)) {
+      await adapter.client.sendMessage(message.chatId, demoMessage());
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: command.name,
+        commandAlias: requestedAlias,
+        outcome: 'denied',
+        permissionResult: 'demo_gate',
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    // Gating é por handler (isMaster/isSenderGroupAdmin) — middleware
+    // central não existe por decisão arquitetural: cada comando é dono do
+    // próprio gate (ver setwelcome.ts, kick.ts, cmdToggle.ts, etc.).
+
+    // Rate limiting por usuário (20 comandos/minuto)
+    const rate = rateLimiter.checkLimit(message.userId);
+    if (rate.limitExceeded) {
+      metricsService.incrementRateLimitHit();
+      const waitSec = Math.ceil((rate.resetTime - Date.now()) / 1000);
+      await adapter.client.sendMessage(
+        message.chatId,
+        `⏳ Você excedeu o limite de comandos. Aguarde ~${waitSec}s antes de usar outro comando.`
+      );
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: command.name,
+        commandAlias: requestedAlias,
+        outcome: 'rate_limited',
+        permissionResult: 'allowed',
+        durationMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    // INC-015 D2 — $cmd: comando desativado para este grupo?
+    // ($cmd é imune ao próprio gate: desativá-lo seria lock-out —
+    // não existiria comando para reativar.)
+    if (command.name !== 'cmd') {
+      const cmdEnabled = await commandConfigService.isEnabled(message.chatId, command.name);
+      if (!cmdEnabled) {
+        await adapter.client.sendMessage(
+          message.chatId,
+          `⚠️ O comando \`${command.name}\` está desativado neste grupo. (\`$cmd ${command.name} on\` reativa)`
+        );
+        // outcome 'rejected': a tabela command_logs tem CHECK constraint sem
+        // 'disabled' — rebuild da tabela não compensa por uma métrica.
+        await this.recordCommandTelemetry(message, adapter, {
+          commandName: command.name,
+          commandAlias: requestedAlias,
+          outcome: 'rejected',
+          permissionResult: 'denied',
+          durationMs: Date.now() - startedAt,
+        });
+        return;
+      }
+    }
+
+    // Criar contexto unificado
+    const ctx = await this.createCommandContext(message, adapter.client);
+
+    try {
+      logger.info(`[PlatformManager] Executando ${message.commandName} em ${adapter.platform} para ${message.userName}`);
+
+      // Registrar métricas e uso
+      metricsService.incrementCommand(message.commandName!, adapter.platform);
+      await this.logCommandUsage(message.commandName!, message.userId, message.chatId);
+
+      await command.execute(ctx);
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: command.name,
+        commandAlias: requestedAlias,
+        outcome: 'success',
+        permissionResult: 'allowed',
+        durationMs: Date.now() - startedAt,
+      });
+    } catch (error: any) {
+      logError(`Command:${message.commandName}`, error);
+      metricsService.recordCommandError(command.name, 'execution_error', adapter.platform);
+      await this.recordCommandTelemetry(message, adapter, {
+        commandName: command.name,
+        commandAlias: requestedAlias,
+        outcome: 'error',
+        permissionResult: 'allowed',
+        durationMs: Date.now() - startedAt,
+        errorCode: 'execution_error',
+      });
+      await ctx.reply('⚠️ Ocorreu um erro interno ao executar este comando.');
+    } finally {
+      metricsService.recordCommandExecutionDuration(command.name, Date.now() - startedAt);
+    }
+  }
+
+  /** Persiste a trilha de uso sem deixar uma falha de observabilidade afetar o bot. */
+  private async recordCommandTelemetry(
+    message: PlatformMessage,
+    adapter: PlatformAdapter,
+    event: {
+      commandName: string;
+      commandAlias: string;
+      outcome: 'success' | 'error' | 'rejected' | 'rate_limited' | 'unsupported' | 'not_found';
+      permissionResult: 'allowed' | 'denied' | 'not_checked';
+      durationMs: number;
+      errorCode?: string;
+    },
+  ): Promise<void> {
+    try {
+      const { recordCommandUsageEvent } = await import('../services/databaseService.js');
+      await recordCommandUsageEvent({
+        ...event,
+        platform: adapter.platform,
+        botId: adapter.client.userId,
+        chatId: message.chatId,
+        chatType: message.raw?.isGroup === true ? 'group' : message.raw?.isGroup === false ? 'private' : 'unknown',
+        userId: message.userId,
+        correlationId: message.correlationId || message.id,
+      });
+    } catch (error) {
+      logError('CommandTelemetry', error);
+    }
+  }
+
+  /**
+   * Registra uso de comando no banco de dados
+   */
+  private async logCommandUsage(commandName: string, userId: string, groupId: string): Promise<void> {
+    try {
+      // Importar dinamicamente para evitar dependência circular
+      const { getDb } = await import('../services/databaseService.js');
+      const db = await getDb();
+      
+      // Limpar prefixos de plataforma dos IDs
+      const cleanUserId = userId.replace(/^(wpp:|tg:|dc:)/, '');
+      const cleanGroupId = groupId.replace(/^(wpp:|tg:|dc:)/, '');
+      
+      await db.run(
+        'INSERT INTO command_logs (command_name, user_id, group_id) VALUES (?, ?, ?)',
+        [commandName, cleanUserId, cleanGroupId]
+      );
+    } catch (error) {
+      // Não falhar o comando se logging falhar
+      logError('LogCommandUsage', error);
+    }
+  }
+
+  /**
+   * Cria CommandContext unificado
+   */
+  private async createCommandContext(message: PlatformMessage, client: PlatformClient): Promise<CommandContext> {
+    let groupName: string | undefined;
+    let contextIsAdmin = false;
+    try {
+      const chat = await client.getChat(message.chatId);
+      groupName = (chat as any)?.name;
+      // Admin do grupo: fonte ÚNICA (groupAdmin). Reconhece o usuário por LID
+      // ou PN usando a relação real do groupMetadata — nunca por comparação
+      // direta de cleanId, que falha quando o remetente aparece como @lid e o
+      // resto do sistema usa @s.whatsapp.net (BUG conhecido do $kick).
+      contextIsAdmin = isSenderGroupAdmin(chat as any, message.userId);
+    } catch { /* ignora — sem metadata, isAdmin permanece false */ }
+    return {
+      msg: message,
+      client,
+      args: message.args || [],
+      platform: message.platform,
+      chatId: message.chatId,
+      userId: message.userId,
+      userName: message.userName,
+      groupName,
+      isGroup: message.raw?.isGroup || false,
+      isMaster: isMaster(message.userId),
+      isAdmin: contextIsAdmin,
+      reply: async (text: string, options?: SendOptions) => {
+        // Telemetria: mensagem enviada
+        metricsService.recordMessageSent(message.platform);
+
+        const isLabMode = process.env.WPP_LAB_MODE === '1';
+        const isFromBot = message.isFromMe === true;
+
+        logInfo(`[reply] isFromBot=${isFromBot}, isLabMode=${isLabMode}, msgId=${message.id}, chatId=${message.chatId}, text=${text.substring(0,50)}...`);
+
+        let sentMsg: any;
+        try {
+          // Sempre fazer quote em lab mode (WPP_LAB_MODE=1) ou quando mensagem NÃO é do bot
+          // O Baileys exige payload com { text, quoted: mensagemOriginal.raw } para renderizar o balão de citação
+          if (isLabMode || !isFromBot) {
+            // Baileys v7: quoted deve ser a mensagem original completa (raw)
+            // O sender usa originalRawMessage se disponível, reconstruindo a key caso contrário
+            const replyOpts = {
+              ...options,
+              replyToMessageId: message.id,
+              quotedFromMe: isFromBot,
+              quotedParticipant: message.userId,
+              originalKey: message.raw?.key,
+              originalRawMessage: message.raw,
+            };
+            logInfo(`[reply] Enviando COM quote (lab=${isLabMode}): replyTo=${message.id}, originalKey=${message.raw?.key?.id || 'NAO'}`);
+            sentMsg = await client.sendMessage(message.chatId, text, replyOpts);
+          } else {
+            // Mensagem do próprio bot em produção - enviar sem quote
+            sentMsg = await client.sendMessage(message.chatId, text, options);
+          }
+        } catch (quoteErr: any) {
+          logWarning(`[reply] quote falhou, reenviando sem quote: ${quoteErr?.message}`);
+          sentMsg = await client.sendMessage(message.chatId, text, options);
+        }
+
+        // Retornar a mensagem enviada para permitir reação ancorada na key
+        return sentMsg;
+      },
+      replyPrivate: async (text: string) => {
+        // Para WhatsApp, envia no privado do usuário
+        // Para Telegram/Discord, envia DM
+        await client.sendMessage(message.userId, text);
+      },
+      getChat: () => client.getChat(message.chatId),
+      getUser: () => client.getUser(message.userId),
+    };
+  }
+
+  /**
+   * Registra comando global (disponível em todas plataformas)
+   */
+  registerCommand(command: ICommand): void {
+    if (this.commandRegistry.has(command.name)) {
+      logWarning(`[PlatformManager] Comando ${command.name} já registrado — ignorando duplicata`);
+      return;
+    }
+    this.commandRegistry.set(command.name, command);
+    logger.info(`[PlatformManager] Comando registrado: ${command.name}${command.platforms ? ` (${command.platforms.join(', ')})` : ' (todas)'}`);
+  }
+
+  /**
+   * Carrega múltiplos comandos de uma vez
+   */
+  loadCommands(commands: Map<string, ICommand>): void {
+    for (const [name, command] of commands) {
+      this.registerCommand(command);
+    }
+  }
+
+  /** Carrega comandos '#' (fun/midia) em registry separado dos uteis. */
+  loadFunCommands(commands: Map<string, ICommand>): void {
+    for (const [name, command] of commands) {
+      if (!this.funCommandRegistry.has(name)) this.funCommandRegistry.set(name, command);
+    }
+  }
+
+  /**
+   * Envia mensagem para uma plataforma específica
+   */
+  async sendMessage(platform: PlatformType, chatId: string, text: string, options?: SendOptions): Promise<void> {
+    const adapter = this.adapters.get(platform);
+    if (!adapter) {
+      throw new Error(`Plataforma ${platform} não inicializada`);
+    }
+    await adapter.client.sendMessage(chatId, text, options);
+  }
+
+  /**
+   * Envia mensagem para TODAS as plataformas (broadcast)
+   */
+  async broadcast(text: string, options?: SendOptions): Promise<void> {
+    for (const [platform, adapter] of this.adapters) {
+      try {
+        // Buscar chats ativos dessa plataforma
+        const chats = await adapter.client.getChats();
+        for (const chat of chats) {
+          if (chat.isGroup) { // Apenas grupos para broadcast
+            await adapter.client.sendMessage(chat.id, text, options);
+          }
+        }
+      } catch (error) {
+        logError(`Broadcast:${platform}`, error);
+      }
+    }
+  }
+
+  /**
+   * Obtém cliente de uma plataforma
+   */
+  getClient(platform: PlatformType): PlatformClient | undefined {
+    return this.adapters.get(platform)?.client;
+  }
+
+  /**
+   * Retorna o adapter registrado de uma plataforma (ou por prefixo, ex: "whatsapp").
+   * Substitui o acesso direto a `this.adapters` (privado) por uma API estável.
+   */
+  getAdapter(platform: PlatformType): PlatformAdapter | undefined {
+    let adapter = this.adapters.get(platform);
+    if (!adapter) {
+      for (const [key, value] of this.adapters) {
+        if (key.startsWith(platform) || platform.startsWith(key)) {
+          adapter = value;
+          break;
+        }
+      }
+    }
+    return adapter;
+  }
+
+  /**
+   * Verifica se plataforma está pronta
+   */
+  isReady(platform: PlatformType): boolean {
+    return this.adapters.get(platform)?.client.isReady || false;
+  }
+
+  /**
+   * Registra handler global de mensagens
+   */
+  onMessage(handler: MessageHandler): void {
+    this.messageHandlers.push(handler);
+  }
+
+  /**
+   * Registra handler de pronto
+   */
+  onReady(handler: () => void): void {
+    this.readyHandlers.push(handler);
+  }
+
+  /**
+   * Registra handler de desconexão
+   */
+  onDisconnected(handler: (platform: PlatformType, reason: string) => void): void {
+    this.disconnectedHandlers.push(handler);
+  }
+
+  /**
+   * Desliga todas as plataformas
+   */
+  async shutdownAll(): Promise<void> {
+    logger.info('[PlatformManager] Desligando todas as plataformas...');
+    for (const [platform, adapter] of this.adapters) {
+      try {
+        await adapter.shutdown();
+        logger.info(`[PlatformManager] ✅ ${platform} desligado`);
+      } catch (error) {
+        logError(`Shutdown:${platform}`, error);
+      }
+    }
+    this.initialized = false;
+  }
+
+  /** Para compatibilidade com multiPlatform.ts — delega para shutdownAll() */
+  async shutdown(): Promise<void> {
+    return this.shutdownAll();
+  }
+
+  /**
+   * Lista plataformas ativas
+   */
+  getActivePlatforms(): PlatformType[] {
+    return Array.from(this.adapters.keys());
+  }
+
+  /**
+   * Envia mensagem para o chat e processa comandos (se houver)
+   * Faz o bot "digitar" a mensagem e responder
+   */
+  async sendMessageAndProcess(platform: string, chatId: string, text: string, forceProcess = false, asUserId?: string): Promise<any> {
+    // Log detalhado para debug
+    const availableAdapters = Array.from(this.adapters.keys());
+    logInfo(`[sendMessageAndProcess] Plataforma solicitada: "${platform}"`);
+    logInfo(`[sendMessageAndProcess] Adapters disponíveis: [${availableAdapters.join(', ')}]`);
+    logInfo(`[sendMessageAndProcess] this.adapters.size: ${this.adapters.size}`);
+    
+    // Buscar adapter (suporta prefixos como whatsapp:558581344211)
+    let adapter = this.adapters.get(platform);
+    if (!adapter) {
+      for (const [key, value] of this.adapters) {
+        if (key.startsWith(platform) || platform.startsWith(key)) {
+          adapter = value;
+          break;
+        }
+      }
+    }
+    logInfo(`[sendMessageAndProcess] Adapter encontrado: ${adapter ? `SIM (${adapter.platform})` : 'NÃO'}`);
+    
+    if (!adapter) {
+      throw new Error(`Plataforma não encontrada: ${platform} (disponíveis: ${availableAdapters.join(', ')})`);
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ETAPA 1: Enviar a mensagem "$menu" para o grupo
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logInfo(`[sendMessageAndProcess] Enviando "${text}" para ${chatId} via ${adapter.platform}`);
+    let sentMessage: any;
+    let sentMessageId: string = `sent-${Date.now()}`;
+    try {
+      sentMessage = await adapter.client.sendMessage(chatId, text);
+      sentMessageId = sentMessage?.id || sentMessage?.raw?.key?.id || `sent-${Date.now()}`;
+      logInfo(`[sendMessageAndProcess] Mensagem enviada com sucesso (id: ${sentMessageId})`);
+    } catch (err: any) {
+      logError(`[sendMessageAndProcess]`, err);
+      throw err;
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ETAPA 2: Gerar resposta do menu (simulando o listener)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (text.startsWith('$')) {
+      const commandName = text.replace('$', '').split(' ')[0];
+      const args = text.split(' ').slice(1);
+      
+      logInfo(`[sendMessageAndProcess] Processando comando $${commandName}`);
+      
+      // Buscar o comando
+      const command = this.commandRegistry.get(commandName);
+      if (command) {
+        try {
+          // Criar PlatformMessage para o comando
+          // ⚠️ O remetente PRECISA ser um usuário real, não o JID do grupo.
+          // Antes usava `userId: chatId`, o que fazia toda verificação de admin
+          // falhar (o "remetente" era o próprio grupo). O caller (/test) pode
+          // passar `asUserId`; default = dono do bot (MASTER).
+          const simulatedUserId = asUserId
+            || process.env.MASTER_USER
+            || process.env.MASTER_NUMBER
+            || '';
+          const commandMsg: PlatformMessage = {
+            id: sentMessageId || `sent-${Date.now()}`,
+            platform: adapter.platform,
+            chatId,
+            userId: simulatedUserId || chatId,
+            userName: 'Bot',
+            text,
+            timestamp: new Date(),
+            isFromMe: false, // Simular mensagem de usuário para testar quote+reaction
+            isCommand: true,
+            commandName,
+            args,
+            raw: { ...sentMessage?.raw, isGroup: true, key: sentMessage?.raw?.key },
+            hasMedia: false,
+            // ⚠️ Popula mentions a partir do texto "@numero" — em produção o
+            // WhatsApp entrega via contextInfo.mentionedJidList, mas o harness
+            // envia texto puro. Sem isso, $kick/$ban respondem
+            // "Mencione alguém..." e nunca executam a remoção.
+            //
+            // Em grupos @lid o WhatsApp entrega o LID na menção, não o PN.
+            // Resolvemos contra o metadata do grupo para reproduzir isso.
+            mentions: await (async () => {
+              const found = text.match(/@(\d{8,})/g) || [];
+              if (!found.length) return [];
+              let parts: any[] = [];
+              try {
+                const chat = await adapter.client.getChat(chatId);
+                parts = (chat as any)?.participants || [];
+              } catch { /* sem metadata → usa PN cru */ }
+              return found.map((m: string) => {
+                const num = m.slice(1);
+                const hit = parts.find((p: any) => {
+                  const pn = String(p?.phoneNumber || '').replace(/\D/g, '');
+                  const id = String(p?.id || '').replace(/\D/g, '');
+                  return pn === num || id === num;
+                });
+                return {
+                  // Preferir o ID como o WhatsApp entrega (@lid em grupos @lid)
+                  id: hit?.id || `${num}@s.whatsapp.net`,
+                  name: '',
+                  isBot: false,
+                  platform: adapter.platform,
+                  raw: hit || {},
+                };
+              });
+            })(),
+          };
+          
+          // Criar contexto completo (com reply, react, etc.)
+          const commandCtx = await this.createCommandContext(commandMsg, adapter.client);
+          
+          // Executar o comando — o comando em si envia a resposta
+          await command.execute(commandCtx);
+          
+          logInfo(`[sendMessageAndProcess] Comando executado com sucesso`);
+          
+          return {
+            success: true,
+            sent: text,
+            platform: adapter.platform,
+            chatId,
+            commandProcessed: true,
+            command: commandName,
+          };
+        } catch (err: any) {
+          logError(`[sendMessageAndProcess]`, err);
+          return {
+            success: true,
+            sent: text,
+            platform: adapter.platform,
+            chatId,
+            commandProcessed: false,
+            error: err.message,
+          };
+        }
+      }
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ETAPA 5: Reagir com 👍 na mensagem original (feedback visual)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if (text.startsWith('$') && sentMessage?.raw?.key) {
+      try {
+        if (typeof adapter.client.react === 'function') {
+          await adapter.client.react(sentMessageId, '👍', chatId, sentMessage.raw?.key);
+          logInfo(`[sendMessageAndProcess] Reagiu com 👍 em ${sentMessageId}`);
+        }
+      } catch (reactErr: any) {
+        logWarning(`[sendMessageAndProcess] erro ao reagir: ${reactErr?.message}`);
+      }
+    }
+
+    // Se não é comando, parar por aqui
+    if (!text.startsWith('$')) {
+      logInfo(`[sendMessageAndProcess] Mensagem comum enviada, sem processamento de comando`);
+      return { success: true, sent: text, platform: adapter.platform, chatId };
+    }
+
+    return { success: true, sent: text, platform: adapter.platform, chatId };
+  }
+
+  /**
+   * Executa um comando de teste diretamente (sem depender de mensagens externas)
+   * Útil para testes automatizados e para contornar limitações de bots não receberem suas próprias mensagens
+   */
+  async executeTestCommand(platform: string, command: string): Promise<any> {
+    // Buscar adapter (suporta prefixos como whatsapp:558581344211)
+    let adapter = this.adapters.get(platform);
+    if (!adapter) {
+      // Buscar por prefixo
+      for (const [key, value] of this.adapters) {
+        if (key.startsWith(platform)) {
+          adapter = value;
+          break;
+        }
+      }
+    }
+    if (!adapter) {
+      throw new Error(`Plataforma não encontrada: ${platform}`);
+    }
+
+    // ChatIds de teste configuráveis via .env (usar chats reais!)
+    const testChatIds: Record<string, string> = {
+      whatsapp: process.env.WPP_TEST_CHAT_ID || '558898314322@c.us',
+      telegram: process.env.TELEGRAM_TEST_CHAT_ID || 'tg:146078742',
+      discord: process.env.DISCORD_TEST_CHAT_ID || 'dc:1521942390082900190',
+    };
+    const testUserIds: Record<string, string> = {
+      whatsapp: process.env.WPP_TEST_USER_ID || '558898314322@c.us',
+      telegram: process.env.TELEGRAM_TEST_USER_ID || 'tg:146078742',
+      discord: process.env.DISCORD_TEST_USER_ID || 'dc:1307158493907652648',
+    };
+
+    const chatId = testChatIds[platform] || testChatIds.whatsapp;
+    const userId = testUserIds[platform] || testUserIds.whatsapp;
+
+    // Criar uma PlatformMessage de teste
+    const testMessage: PlatformMessage = {
+      id: `test-${Date.now()}`,
+      platform,
+      chatId,
+      userId,
+      userName: 'TestUser',
+      text: command,
+      timestamp: new Date(),
+      isFromMe: false,
+      isCommand: true,
+      commandName: command.replace('$', '').split(' ')[0],
+      args: command.split(' ').slice(1),
+      raw: {},
+      hasMedia: false,
+    };
+
+    logInfo(`[TestCommand] Executando ${command} em ${platform} (chat: ${chatId})`);
+
+    // Enviar diretamente para o handleIncomingMessage
+    await this.handleIncomingMessage(testMessage);
+
+    return { success: true, command, platform, chatId };
+  }
+
+  /**
+   * Obtém registry de comandos
+   */
+  getCommandRegistry(): Map<string, ICommand> {
+    return this.commandRegistry;
+  }
+
+  /**
+   * Retorna o último chatId visto em uma plataforma (para comandos de ponte entre plataformas)
+   */
+  getLastChat(platform: PlatformType): string | undefined {
+    return this.lastChatByPlatform.get(platform);
+  }
+}
+
+export const platformManager = PlatformManager.getInstance();

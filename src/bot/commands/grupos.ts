@@ -1,0 +1,54 @@
+import { ICommand } from './types';
+import { isMaster } from '../../services/permissions';
+import { findParticipant } from '../../services/groupAdmin';
+import { logInfo, logWarning, logError } from '../../services/loggerService';
+
+export const gruposCommand: ICommand = {
+    name: 'grupos',
+    description: 'Lista todos os grupos em que o bot está presente (Apenas MASTER).',
+    async execute(ctx) {
+        const authorId = ctx.userId;
+
+        if (!isMaster(authorId)) {
+            await ctx.reply('❌ Comando restrito ao MASTER do bot.');
+            return;
+        }
+
+        try {
+            const chats = await ctx.client.getChats();
+            const groups = chats.filter(chat => chat.isGroup);
+
+            if (groups.length === 0) {
+                await ctx.reply('❌ O bot não está em nenhum grupo no momento.');
+                return;
+            }
+
+            let response = `📋 **LISTA DE GRUPOS (${groups.length})**\n\n`;
+
+            for (const group of groups) {
+                // Usa a fonte única: reconhece o bot por LID, PN ou PN-com-device
+                const botMember = findParticipant(group, ctx.client.userId);
+                const isBotAdmin = Boolean(botMember && (botMember.isAdmin || botMember.isSuperAdmin));
+                logInfo(`[GRUPOS] Verificando ${group.name} | Eu sou admin? ${isBotAdmin ? 'true' : 'false'}`);
+                
+                response += `👥 **${group.name}**\n`;
+                response += `🆔 \`${group.id}\`\n`;
+                response += `🛡️ Admin: ${isBotAdmin ? '✅ Sim' : '❌ Não'}\n`;
+                response += `👤 Membros: ${(group.participants || []).length}\n`;
+                response += `--------------------------\n`;
+
+                if (response.length > 3500) {
+                    await ctx.reply(response);
+                    response = '';
+                }
+            }
+
+            if (response) {
+                await ctx.reply(response);
+            }
+        } catch (error) {
+            logError('❌ Erro no $grupos:', error);
+            await ctx.reply('⚠️ Erro ao listar grupos.');
+        }
+    }
+};
